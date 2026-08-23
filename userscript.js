@@ -10,6 +10,10 @@
 // @match *://*.listen.overdrive.com/*
 // @match *://*.read.libbyapp.com/?*
 // @match *://*.read.overdrive.com/?*
+// @match *://libbyapp.com/*
+// @match *://*.libbyapp.com/*
+// @match *://overdrive.com/*
+// @match *://*.overdrive.com/*
 // @run-at document-start
 // @icon https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
 // @grant none
@@ -884,7 +888,109 @@ ID3v2.3 + MPEG helpers (no ffmpeg, no CDN)
       );
     }
 
-    async function exportMP3() {
+const LIBREGRAB_PICKER_NS = "libregrab-picker-v1";
+
+    function installTopLevelMp3Picker() {
+      if (window.top !== window.self) return;
+      window.addEventListener("message", (event) => {
+        const data = event.data;
+        if (
+          !data ||
+          data.ns !== LIBREGRAB_PICKER_NS ||
+          data.type !== "REQUEST_MP3_HANDLE"
+        )
+          return;
+        const requester = event.source;
+        const suggestedName = data.suggestedName || "audiobook.mp3";
+        const panel = document.createElement("div");
+        panel.style.cssText =
+          "position:fixed;z-index:2147483647;top:20px;right:20px;max-width:360px;padding:14px;background:#1f1f1f;color:#fff;border:1px solid #555;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.55);font:14px sans-serif";
+        const message = document.createElement("div");
+        message.textContent =
+          "LibreGRAB: choose where to save the single MP3.";
+        message.style.marginBottom = "10px";
+        const choose = document.createElement("button");
+        choose.textContent = "Choose MP3 destination";
+        choose.style.cssText = "margin-right:8px;padding:8px 10px;cursor:pointer;";
+        const cancel = document.createElement("button");
+        cancel.textContent = "Cancel";
+        cancel.style.cssText = "padding:8px 10px;cursor:pointer;";
+        const cleanup = () => panel.remove();
+        cancel.onclick = () => {
+          requester.postMessage(
+            {
+              ns: LIBREGRAB_PICKER_NS,
+              type: "MP3_HANDLE_ERROR",
+              message: "Save cancelled.",
+            },
+            "*",
+          );
+          cleanup();
+        };
+        choose.onclick = async () => {
+          try {
+            const handle = await window.showSaveFilePicker({
+              suggestedName,
+              types: [
+                { description: "MP3 audio", accept: { "audio/mpeg": [".mp3"] } },
+              ],
+            });
+            requester.postMessage(
+              { ns: LIBREGRAB_PICKER_NS, type: "MP3_HANDLE", handle },
+              "*",
+            );
+          } catch (error) {
+            requester.postMessage(
+              {
+                ns: LIBREGRAB_PICKER_NS,
+                type: "MP3_HANDLE_ERROR",
+                message:
+                  error?.name === "AbortError"
+                    ? "Save cancelled."
+                    : String(error?.message || error),
+              },
+              "*",
+            );
+          } finally {
+            cleanup();
+          }
+        };
+        panel.append(message, choose, cancel);
+        document.body.appendChild(panel);
+      });
+    }
+    installTopLevelMp3Picker();
+
+    function requestTopLevelMp3Handle(suggestedName) {
+      if (window.top === window.self) {
+        return window.showSaveFilePicker({
+          suggestedName,
+          types: [
+            { description: "MP3 audio", accept: { "audio/mpeg": [".mp3"] } },
+          ],
+        });
+      }
+      return new Promise((resolve, reject) => {
+        const onMessage = (event) => {
+          const data = event.data;
+          if (!data || data.ns !== LIBREGRAB_PICKER_NS) return;
+          if (data.type === "MP3_HANDLE") {
+            window.removeEventListener("message", onMessage);
+            resolve(data.handle);
+          } else if (data.type === "MP3_HANDLE_ERROR") {
+            window.removeEventListener("message", onMessage);
+            reject(new Error(data.message || "Could not select an output file."));
+          }
+        };
+        window.addEventListener("message", onMessage);
+        window.top.postMessage(
+          { ns: LIBREGRAB_PICKER_NS, type: "REQUEST_MP3_HANDLE", suggestedName },
+          "*",
+        );
+      });
+    }
+
+        async function exportMP3() {
       if (downloadState != -1) return;
       if (typeof window.showSaveFilePicker !== "function") {
         alert(
@@ -894,13 +1000,9 @@ ID3v2.3 + MPEG helpers (no ffmpeg, no CDN)
       }
       let handle;
       try {
-        handle = await window.showSaveFilePicker({
-          suggestedName:
-            getAuthorString() + " - " + BIF.map.title.main + ".mp3",
-          types: [
-            { description: "MP3 audio", accept: { "audio/mpeg": [".mp3"] } },
-          ],
-        });
+        handle = await requestTopLevelMp3Handle(
+          getAuthorString() + " - " + BIF.map.title.main + ".mp3",
+        );
       } catch (e) {
         if (e && e.name === "AbortError") return;
         alert(e.message);
