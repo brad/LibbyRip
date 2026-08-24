@@ -151,6 +151,12 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         var pad = new Array(1 + padlen).join(pad_char);
         return (pad + num).slice(-pad.length);
     }
+
+    function logLine(html){
+        downloadElem.innerHTML += html;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+    }
+
     let firstChapClick = true;
     function viewChapters(){
         // Populate chapters ONLY after first viewing
