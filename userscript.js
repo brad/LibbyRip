@@ -28,7 +28,7 @@
 window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     window.__libregrabResolveClientZip = resolve;
     window.__libregrabRejectClientZip = reject;
-    });
+});
 `;
     function mainCode() {
     
@@ -58,20 +58,22 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         width: 100%;
         height: 0%;
         z-index: 1000;
+
         background-color: grey;
         color: white;
+
         overflow-x: hidden;
         overflow-y: scroll;
+
         transition: height 0.3s
     }
-    .foldMenu.active{
+    .active{
         height: 40%;
         border: double;
     }
     .pChapLabel{
         font-size: 2em;
     }`;
-
     /* =========================================
               BEGIN AUDIOBOOK SECTION!
        =========================================
@@ -145,7 +147,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         }
         return ret;
     }
-
     function paddy(num, padlen, padchar) {
         var pad_char = typeof padchar !== 'undefined' ? padchar : '0';
         var pad = new Array(1 + padlen).join(pad_char);
