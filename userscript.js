@@ -1,18 +1,18 @@
 // ==UserScript==
-// @name LibreGRAB
-// @namespace http://tampermonkey.net/
-// @version 2026-08-22
-// @description Download all the booty! Audiobooks export as a streamed ID3-tagged MP3 or a zip of tagged parts. No ffmpeg.
-// @author PsychedelicPalimpsest
-// @license MIT
-// @supportURL https://github.com/PsychedelicPalimpsest/LibbyRip/issues
-// @match *://*.listen.libbyapp.com/*
-// @match *://*.listen.overdrive.com/*
-// @match *://*.read.libbyapp.com/?*
-// @match *://*.read.overdrive.com/?*
-// @run-at document-start
-// @icon https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
-// @grant none
+// @name          LibreGRAB
+// @namespace     http://tampermonkey.net/
+// @version       2026-06-01
+// @description   Download all the booty!  Audiobooks export as a streamed ID3-tagged MP3 or a zip of tagged parts.
+// @author        PsychedelicPalimpsest
+// @license       MIT
+// @supportURL    https://github.com/PsychedelicPalimpsest/LibbyRip/issues
+// @match         *://*.listen.libbyapp.com/*
+// @match         *://*.listen.overdrive.com/*
+// @match         *://*.read.libbyapp.com/?*
+// @match         *://*.read.overdrive.com/?*
+// @run-at        document-start
+// @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
+// @grant         none
 // @downloadURL https://update.greasyfork.org/scripts/498782/LibreGRAB.user.js
 // @updateURL https://update.greasyfork.org/scripts/498782/LibreGRAB.meta.js
 // ==/UserScript==
@@ -24,250 +24,266 @@
 // extension context) and injected into the page once it is ready.
 
 (function () {
-const clientZipReadyCode = `
+    const clientZipReadyCode = `
 window.__libregrabClientZipReady = new Promise((resolve, reject) => {
-window.__libregrabResolveClientZip = resolve;
-window.__libregrabRejectClientZip = reject;
-});
+    window.__libregrabResolveClientZip = resolve;
+    window.__libregrabRejectClientZip = reject;
+    });
 `;
-function mainCode() {
+    function mainCode() {
+    
+    let downloadElem;
+    let BIF;
+    async function getDownloadZip() {
+        if (window.downloadZip) return window.downloadZip;
+        if (window.__libregrabClientZipReady) return window.__libregrabClientZipReady;
+        throw new Error("client-zip did not load");
+    }
 
-let downloadElem;
-let BIF;
-async function getDownloadZip() {
-if (window.downloadZip) return window.downloadZip;
-if (window.__libregrabClientZipReady) return window.__libregrabClientZipReady;
-throw new Error("client-zip did not load");
-}
+    const CSS = `
+    .pNav{
+        background-color: red;
+        width: 100%;
+        display: flex;
+        justify-content: space-between;
+    }
+    .pLink{
+        color: blue;
+        text-decoration-line: underline;
+        padding: .25em;
+        font-size: 1em;
+    }
+    .foldMenu{
+        position: absolute;
+        width: 100%;
+        height: 0%;
+        z-index: 1000;
+        background-color: grey;
+        color: white;
+        overflow-x: hidden;
+        overflow-y: scroll;
+        transition: height 0.3s
+    }
+    .foldMenu.active{
+        height: 40%;
+        border: double;
+    }
+    .pChapLabel{
+        font-size: 2em;
+    }`;
 
-const CSS = `
-.pNav{
-background-color: red;
-width: 100%;
-display: flex;
-justify-content: space-between;
-}
-.pLink{
-color: blue;
-text-decoration-line: underline;
-padding: .25em;
-font-size: 1em;
-}
-.foldMenu{
-position: absolute;
-width: 100%;
-height: 0%;
-z-index: 1000;
-background-color: grey;
-color: white;
-overflow-x: hidden;
-overflow-y: scroll;
-transition: height 0.3s
-}
-.foldMenu.active{
-height: 40%;
-border: double;
-}
-.pChapLabel{
-font-size: 2em;
-}`;
+    /* =========================================
+              BEGIN AUDIOBOOK SECTION!
+       =========================================
+    */
+
+
+    // Libby, somewhere, gets the crypto stuff we need for mp3 urls, then removes it before adding it to the BIF.
+    // here, we simply hook json parse to get it for us!
+
+    const old_parse = JSON.parse;
+    let odreadCmptParams = null;
+    JSON.parse = function(...args){
+        let ret = old_parse(...args);
+        if (typeof(ret) == "object" && ret["b"] != undefined && ret["b"]["-odread-cmpt-params"] != undefined){
+            odreadCmptParams = Array.from(ret["b"]["-odread-cmpt-params"]);
+        }
+
+        return ret;
+    }
+
+
+
+    const audioBookNav = `
+        <a class="pLink" id="chap"> <h1> View chapters </h1> </a>
+        <a class="pLink" id="down"> <h1> Export as MP3 </h1> </a>
+        <a class="pLink" id="exp"> <h1> Export audiobook </h1> </a>
+    `;
+    const chaptersMenu = `
+        <h2>This book contains {CHAPTERS} chapters.</h2>
+        <button class="shibui-button" style="background-color: white" id="dumpAll"> Download all </button><br>
+    `;
+    let chapterMenuElem;
+
+    function buildPirateUi(){
+        // Create the nav
+        let nav = document.createElement("div");
+        nav.innerHTML = audioBookNav;
+        nav.querySelector("#chap").onclick = viewChapters;
+        nav.querySelector("#down").onclick = exportMP3;
+        nav.querySelector("#exp").onclick = exportChapters;
+        nav.classList.add("pNav");
+        let pbar = document.querySelector(".nav-progress-bar");
+        pbar.insertBefore(nav, pbar.children[1]);
+
+        // Create the chapters menu
+        chapterMenuElem = document.createElement("div");
+        chapterMenuElem.classList.add("foldMenu");
+        chapterMenuElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
+        const urls = getUrls();
+
+        chapterMenuElem.innerHTML = chaptersMenu.replace("{CHAPTERS}", urls.length);
+        document.body.appendChild(chapterMenuElem);
+
+        downloadElem = document.createElement("div");
+        downloadElem.classList.add("foldMenu");
+        downloadElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
+        document.body.appendChild(downloadElem);
+    }
+    function getUrls(){
+        let ret = [];
+        for (let spine of BIF.objects.spool.components){
+            let data = {
+
+                url: location.origin + "/" + spine.meta.path + "?" + odreadCmptParams[spine.spinePosition],
+                index : spine.meta["-odread-spine-position"],
+                duration: spine.meta["audio-duration"],
+                size: spine.meta["-odread-file-bytes"],
+                type: spine.meta["media-type"]
+            };
+            ret.push(data);
+        }
+        return ret;
+    }
+
+    function paddy(num, padlen, padchar) {
+        var pad_char = typeof padchar !== 'undefined' ? padchar : '0';
+        var pad = new Array(1 + padlen).join(pad_char);
+        return (pad + num).slice(-pad.length);
+    }
+    let firstChapClick = true;
+    function viewChapters(){
+        // Populate chapters ONLY after first viewing
+        if (firstChapClick){
+            firstChapClick = false;
+            for (let url of getUrls()){
+                let span = document.createElement("span");
+                span.classList.add("pChapLabel")
+                span.textContent = "#" + (1 + url.index);
+
+                let audio = document.createElement("audio");
+                audio.setAttribute("controls", "");
+                let source = document.createElement("source");
+                source.setAttribute("src", url.url);
+                source.setAttribute("type", url.type);
+                audio.appendChild(source);
+
+                chapterMenuElem.appendChild(span);
+                chapterMenuElem.appendChild(document.createElement("br"));
+                chapterMenuElem.appendChild(audio);
+                chapterMenuElem.appendChild(document.createElement("br"));
+            }
+        }
+        if (chapterMenuElem.classList.contains("active"))
+            chapterMenuElem.classList.remove("active");
+        else
+            chapterMenuElem.classList.add("active");
+        chapterMenuElem.querySelector("#dumpAll").onclick = async function(){
+
+            chapterMenuElem.querySelector("#dumpAll").style.display = "none";
+
+            await Promise.all(getUrls().map(async function(url){
+                const res = await fetch(url.url);
+                const blob = await res.blob();
+
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = `${getAuthorString()} - ${BIF.map.title.main}.${url.index}.mp3`;
+                link.click();
+
+                URL.revokeObjectURL(link.href);
+            }));
+
+            chapterMenuElem.querySelector("#dumpAll").style.display = "";
+        };
+    }
+
+    function getCreatorsByRole(role){
+        return (BIF.map.creator || [])
+            .filter(creator => String(creator.role || "").toLowerCase().includes(role))
+            .map(creator => creator.name)
+            .filter(Boolean)
+            .join(", ");
+    }
+
+    function getAuthorString(){
+        return getCreatorsByRole("author") || "Unknown";
+    }
+    
+    function getNarratorString(){
+        return getCreatorsByRole("narrator");
+    }
+
+    function getMetadata(){
+        let spineToIndex = BIF.map.spine.map((x)=>x["-odread-original-path"]);
+        let metadata = {
+            title: BIF.map.title.main,
+            description: BIF.map.description,
+            coverUrl: BIF.root.querySelector("image").getAttribute("href"),
+            creator: BIF.map.creator,
+            spine: BIF.map.spine.map((x)=>{return {
+                duration: x["audio-duration"],
+                type: x["media-type"],
+                bitrate: x["audio-bitrate"],
+            }})
+        };
+        if (BIF.map.nav.toc != undefined){
+            metadata.chapters = BIF.map.nav.toc.map((rChap)=>{
+                return {
+                    title: rChap.title,
+                    spine: spineToIndex.indexOf(rChap.path.split("#")[0]),
+                    offset: 1*(rChap.path.split("#")[1] | 0)
+                };
+            });
+        }
+        return metadata;
+
+    }
+
+    function guessImageMime(nameOrUrl, fallback){
+        const ext = String(nameOrUrl || "").split("?")[0].split(".").pop().toLowerCase();
+        return ({
+            jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+            gif: "image/gif", webp: "image/webp", bmp: "image/bmp"
+        })[ext] || fallback || "image/jpeg";
+    }
+    
+    async function loadCover(metadata){
+        if (!metadata || !metadata.coverUrl) return { bytes: null, mime: null, name: null, blob: null };
+        try {
+            const response = await fetch(metadata.coverUrl);
+            if (!response.ok) throw new Error("HTTP " + response.status);
+            const blob = await response.blob();
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            const ext = metadata.coverUrl.split("?")[0].split(".").pop() || "jpg";
+            return { bytes, mime: blob.type || guessImageMime(metadata.coverUrl), name: "cover." + ext, blob };
+        } catch (e) {
+            console.warn("LibreGRAB: cover fetch failed", e);
+            return { bytes: null, mime: null, name: null, blob: null };
+        }
+    }
+
+    async function createMetadata(){
+        let metadata = getMetadata();
+        const response = await fetch(metadata.coverUrl);
+        const blob = await response.blob();
+        const csplit = metadata.coverUrl.split(".");
+        return [
+            {
+                name: "metadata/cover." + csplit[csplit.length-1],
+                input: blob
+            },
+            {
+                name: "metadata/metadata.json",
+                input: JSON.stringify(metadata, null, 2)
+            }
+        ];
+    }
 
 /* =========================================
-BEGIN AUDIOBOOK SECTION!
-========================================= */
-
-const old_parse = JSON.parse;
-let odreadCmptParams = null;
-JSON.parse = function(...args){
-let ret = old_parse(...args);
-if (typeof(ret) == "object" && ret["b"] != undefined && ret["b"]["-odread-cmpt-params"] != undefined){
-odreadCmptParams = Array.from(ret["b"]["-odread-cmpt-params"]);
-}
-return ret;
-};
-
-const audioBookNav = `
-<a class="pLink" id="chap"><h1>View chapters</h1></a>
-<a class="pLink" id="down"><h1>Export as MP3</h1></a>
-<a class="pLink" id="exp"><h1>Export audiobook</h1></a>
-`;
-const chaptersMenu = `
-<h2>This book contains CHAPTERS chapters.</h2>
-<button class="shibui-button" style="background-color: white" id="dumpAll">Download all</button><br>
-`;
-let chapterMenuElem;
-
-function buildPirateUi(){
-let nav = document.createElement("div");
-nav.innerHTML = audioBookNav;
-nav.querySelector("#chap").onclick = viewChapters;
-nav.querySelector("#down").onclick = exportMP3;
-nav.querySelector("#exp").onclick = exportChapters;
-nav.classList.add("pNav");
-let pbar = document.querySelector(".nav-progress-bar");
-pbar.insertBefore(nav, pbar.children[1]);
-
-chapterMenuElem = document.createElement("div");
-chapterMenuElem.classList.add("foldMenu");
-chapterMenuElem.setAttribute("tabindex", "-1");
-const urls = getUrls();
-chapterMenuElem.innerHTML = chaptersMenu.replace("CHAPTERS", urls.length);
-document.body.appendChild(chapterMenuElem);
-
-downloadElem = document.createElement("div");
-downloadElem.classList.add("foldMenu");
-downloadElem.setAttribute("tabindex", "-1");
-document.body.appendChild(downloadElem);
-}
-
-function getUrls(){
-let ret = [];
-for (let spine of BIF.objects.spool.components){
-ret.push({
-url: location.origin + "/" + String(spine.meta.path).replace(/^\//, "") + "?" + odreadCmptParams[spine.spinePosition],
-index: spine.meta["-odread-spine-position"],
-duration: spine.meta["audio-duration"],
-size: spine.meta["-odread-file-bytes"],
-type: spine.meta["media-type"]
-});
-}
-return ret;
-}
-
-function paddy(num, padlen, padchar) {
-var pad_char = typeof padchar !== "undefined" ? padchar : "0";
-var pad = new Array(1 + padlen).join(pad_char);
-return (pad + num).slice(-pad.length);
-}
-
-function logLine(html){
-downloadElem.innerHTML += html;
-downloadElem.scrollTo(0, downloadElem.scrollHeight);
-}
-
-let firstChapClick = true;
-function viewChapters(){
-if (firstChapClick){
-firstChapClick = false;
-for (let url of getUrls()){
-let span = document.createElement("span");
-span.classList.add("pChapLabel");
-span.textContent = (1 + url.index);
-let audio = document.createElement("audio");
-audio.setAttribute("controls", "");
-let source = document.createElement("source");
-source.setAttribute("src", url.url);
-source.setAttribute("type", url.type);
-audio.appendChild(source);
-chapterMenuElem.appendChild(span);
-chapterMenuElem.appendChild(document.createElement("br"));
-chapterMenuElem.appendChild(audio);
-chapterMenuElem.appendChild(document.createElement("br"));
-}
-}
-if (chapterMenuElem.classList.contains("active"))
-chapterMenuElem.classList.remove("active");
-else
-chapterMenuElem.classList.add("active");
-
-chapterMenuElem.querySelector("#dumpAll").onclick = async function(){
-chapterMenuElem.querySelector("#dumpAll").style.display = "none";
-const metadata = getMetadata();
-const cover = await loadCover(metadata);
-await Promise.all(getUrls().map(async function(url){
-const res = await fetch(url.url);
-const buf = await res.arrayBuffer();
-const tagged = tagPartMp3(buf, {
-partNumber: url.index + 1,
-totalParts: metadata.spine.length,
-durationSec: url.duration,
-metadata,
-cover
-});
-const link = document.createElement("a");
-link.href = URL.createObjectURL(tagged);
-link.download = getAuthorString() + " - " + BIF.map.title.main + "." + url.index + ".mp3";
-link.click();
-URL.revokeObjectURL(link.href);
-}));
-chapterMenuElem.querySelector("#dumpAll").style.display = "";
-};
-}
-
-function getCreatorsByRole(role){
-return (BIF.map.creator || [])
-.filter(creator => String(creator.role || "").toLowerCase().includes(role))
-.map(creator => creator.name)
-.filter(Boolean)
-.join(", ");
-}
-
-function getAuthorString(){
-return getCreatorsByRole("author") || "Unknown";
-}
-
-function getNarratorString(){
-return getCreatorsByRole("narrator");
-}
-
-function getMetadata(){
-let spineToIndex = BIF.map.spine.map(x => x["-odread-original-path"]);
-let metadata = {
-title: BIF.map.title.main,
-description: BIF.map.description,
-coverUrl: BIF.root.querySelector("image") ? BIF.root.querySelector("image").getAttribute("href") : null,
-creator: BIF.map.creator,
-spine: BIF.map.spine.map(x => ({
-duration: x["audio-duration"],
-type: x["media-type"],
-bitrate: x["audio-bitrate"]
-}))
-};
-if (BIF.map.nav && BIF.map.nav.toc != undefined){
-metadata.chapters = BIF.map.nav.toc.map(rChap => ({
-title: rChap.title,
-spine: spineToIndex.indexOf(rChap.path.split("#")[0]),
-offset: +rChap.path.split("#")[1] || 0
-}));
-}
-return metadata;
-}
-
-function guessImageMime(nameOrUrl, fallback){
-const ext = String(nameOrUrl || "").split("?")[0].split(".").pop().toLowerCase();
-return ({
-jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
-gif: "image/gif", webp: "image/webp", bmp: "image/bmp"
-})[ext] || fallback || "image/jpeg";
-}
-
-async function loadCover(metadata){
-if (!metadata || !metadata.coverUrl) return { bytes: null, mime: null, name: null, blob: null };
-try {
-const response = await fetch(metadata.coverUrl);
-if (!response.ok) throw new Error("HTTP " + response.status);
-const blob = await response.blob();
-const bytes = new Uint8Array(await blob.arrayBuffer());
-const ext = metadata.coverUrl.split("?")[0].split(".").pop() || "jpg";
-return { bytes, mime: blob.type || guessImageMime(metadata.coverUrl), name: "cover." + ext, blob };
-} catch (e) {
-console.warn("LibreGRAB: cover fetch failed", e);
-return { bytes: null, mime: null, name: null, blob: null };
-}
-}
-
-async function createMetadata(){
-const metadata = getMetadata();
-const cover = await loadCover(metadata);
-const files = [];
-if (cover.blob) files.push({ name: "metadata/" + cover.name, input: cover.blob });
-files.push({ name: "metadata/metadata.json", input: JSON.stringify(metadata, null, 2) });
-return { files, cover, metadata };
-}
-
-/* =========================================
-ID3v2.3 + MPEG helpers (no ffmpeg, no CDN)
-========================================= */
+           ID3v2.3 + MPEG helpers
+   =========================================
+*/
 
 function concatBytes(parts){
 const arrays = parts.map(p => p instanceof Uint8Array ? p : new Uint8Array(p));
