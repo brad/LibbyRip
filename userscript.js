@@ -6,13 +6,18 @@
 // @author        PsychedelicPalimpsest
 // @license       MIT
 // @supportURL    https://github.com/PsychedelicPalimpsest/LibbyRip/issues
+// @match         *://libbyapp.com/*
+// @match         *://*.libbyapp.com/*
+// @match         *://overdrive.com/*
+// @match         *://*.overdrive.com/*
 // @match         *://*.listen.libbyapp.com/*
 // @match         *://*.listen.overdrive.com/*
 // @match         *://*.read.libbyapp.com/?*
 // @match         *://*.read.overdrive.com/?*
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
-// @grant         none
+// @grant GM.xmlHttpRequest
+// @grant GM_xmlhttpRequest
 // @downloadURL https://update.greasyfork.org/scripts/498782/LibreGRAB.user.js
 // @updateURL https://update.greasyfork.org/scripts/498782/LibreGRAB.meta.js
 // ==/UserScript==
@@ -32,6 +37,381 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 `;
     function mainCode() {
 
+    const LIBREGRAB_SAVE_REQUEST = 'LIBREGRAB_SAVE_REQUEST';
+    const LIBREGRAB_SAVE_RESULT = 'LIBREGRAB_SAVE_RESULT';
+    const isTopFrame = window.top === window.self;
+
+    function isLibbyFamilyOrigin(origin) {
+        try {
+            const host = new URL(origin).hostname;
+            return host === 'libbyapp.com' || host.endsWith('.libbyapp.com')
+                || host === 'overdrive.com' || host.endsWith('.overdrive.com');
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function isPlayerOrigin(origin) {
+        try {
+            const host = new URL(origin).hostname;
+            return host === 'listen.libbyapp.com' || host.endsWith('.listen.libbyapp.com')
+                || host === 'listen.overdrive.com' || host.endsWith('.listen.overdrive.com');
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function saveBlobFromTopFrame(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        link.style.display = 'none';
+        document.documentElement.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+
+    if (isTopFrame) {
+        window.addEventListener('message', event => {
+            const data = event.data;
+            if (!isPlayerOrigin(event.origin)) return;
+            if (!data || data.type !== LIBREGRAB_SAVE_REQUEST) return;
+            if (!(data.arrayBuffer instanceof ArrayBuffer)) return;
+            const filename = String(data.filename || 'audiobook.mp3')
+                .replace(/[\\/:*?"<>|\u0000-\u001f\u007f]+/g, '_')
+                .slice(0, 180) || 'audiobook.mp3';
+            saveBlobFromTopFrame(new Blob([data.arrayBuffer], { type: data.mimeType || 'application/octet-stream' }), filename);
+            event.source.postMessage({
+                type: LIBREGRAB_SAVE_RESULT,
+                requestId: data.requestId,
+                ok: true,
+            }, event.origin);
+        });
+    }
+
+    async function requestSaveFromTopFrame(blob, filename, mimeType) {
+        if (isTopFrame) {
+            saveBlobFromTopFrame(blob, filename);
+            return;
+        }
+        const parentOrigin = document.referrer ? new URL(document.referrer).origin : '';
+        if (!isLibbyFamilyOrigin(parentOrigin)) {
+            throw new Error('Unrecognized top-level Libby/OverDrive origin: ' + parentOrigin);
+        }
+        const arrayBuffer = await blob.arrayBuffer();
+        window.top.postMessage({
+            type: LIBREGRAB_SAVE_REQUEST,
+            requestId: (crypto.randomUUID && crypto.randomUUID()) || String(Date.now()),
+            filename,
+            mimeType: mimeType || blob.type || 'application/octet-stream',
+            arrayBuffer,
+        }, parentOrigin, [arrayBuffer]);
+    }
+
+    function pageWindow() {
+        return (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+    }
+    function gmXhr(details) {
+        const fn = (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function')
+        ? GM.xmlHttpRequest
+        : (typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null);
+        if (!fn) return Promise.reject(new Error('GM.xmlHttpRequest is not available'));
+        return new Promise((resolve, reject) => {
+        fn(Object.assign({}, details, {
+            onload: resolve,
+            onerror: (e) => reject(e && e.error ? new Error(e.error) : new Error('GM.xmlHttpRequest network error')),
+            ontimeout: () => reject(new Error('GM.xmlHttpRequest timed out'))
+        }));
+        });
+    }
+
+    async function gmFetchBlob(url) {
+        const res = await gmXhr({
+        method: 'GET',
+        url,
+        responseType: 'blob',
+        anonymous: true
+        });
+        if (res.status < 200 || res.status >= 300) throw new Error('HTTP ' + res.status);
+        if (!res.response) throw new Error('empty GM.xmlHttpRequest body');
+        return res.response;
+    }
+
+    // Isolated-world window.showSaveFilePicker is a bound-less wrapper; calling
+    // it as a free function throws Illegal invocation. Call it on the page window.
+    const LIBREGRAB_PICK_REQUEST = 'LIBREGRAB_PICK_REQUEST';
+    const LIBREGRAB_PICK_RESULT = 'LIBREGRAB_PICK_RESULT';
+    const LIBREGRAB_WRITE_CHUNK = 'LIBREGRAB_WRITE_CHUNK';
+    const LIBREGRAB_WRITE_ACK = 'LIBREGRAB_WRITE_ACK';
+    const LIBREGRAB_WRITE_CLOSE = 'LIBREGRAB_WRITE_CLOSE';
+    const LIBREGRAB_WRITE_CLOSE_ACK = 'LIBREGRAB_WRITE_CLOSE_ACK';
+    const pendingIframePicks = new Map();
+    const pendingIframeWrites = new Map();
+    const topPickSessions = new Map();
+
+    function libregrabRequestId() {
+        return (globalThis.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random();
+    }
+
+    function iframeParentOrigin() {
+        try {
+            if (document.referrer) return new URL(document.referrer).origin;
+        } catch (e) {}
+        try {
+            if (location.ancestorOrigins && location.ancestorOrigins.length) {
+                return location.ancestorOrigins[0];
+            }
+        } catch (e) {}
+        try {
+            return window.top.location.origin;
+        } catch (e) {}
+        return '';
+    }
+
+    function toArrayBuffer(data) {
+        if (data instanceof ArrayBuffer) return data;
+        if (ArrayBuffer.isView(data)) return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+        if (data instanceof Blob) return data.arrayBuffer();
+        return new Blob([data]).arrayBuffer();
+    }
+
+    function showTopFramePickButton(session) {
+        if (session.button && session.button.isConnected) return;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = 'LibreGRAB: Choose save location — ' + session.filename;
+        button.title = 'Click to open the system file picker';
+        button.style.cssText = [
+            'position:fixed', 'right:16px', 'bottom:16px', 'z-index:2147483647',
+            'max-width:min(90vw, 560px)', 'padding:12px 16px', 'border:1px solid #333',
+            'border-radius:8px', 'background:#fff', 'color:#111', 'font:14px/1.3 sans-serif',
+            'box-shadow:0 2px 12px rgba(0,0,0,.35)', 'cursor:pointer'
+        ].join(';');
+        button.addEventListener('click', async () => {
+            button.disabled = true;
+            button.textContent = 'LibreGRAB: Opening file picker…';
+            try {
+                const w = pageWindow();
+                const picker = w.showSaveFilePicker;
+                if (typeof picker !== 'function') throw new Error('File System Access API is not available on the top-level page');
+                const fileHandle = await picker.call(w, {
+                    suggestedName: session.filename,
+                    types: session.types && session.types.length ? session.types : [{
+                        description: 'MP3 audio',
+                        accept: { 'audio/mpeg': ['.mp3'] }
+                    }]
+                });
+                session.fileHandle = fileHandle;
+                session.writable = await fileHandle.createWritable();
+                button.remove();
+                session.source.postMessage({
+                    type: LIBREGRAB_PICK_RESULT,
+                    requestId: session.requestId,
+                    ok: true,
+                    name: fileHandle.name || session.filename
+                }, session.origin);
+            } catch (error) {
+                button.remove();
+                topPickSessions.delete(session.requestId);
+                session.source.postMessage({
+                    type: LIBREGRAB_PICK_RESULT,
+                    requestId: session.requestId,
+                    ok: false,
+                    cancelled: !!(error && error.name === 'AbortError'),
+                    error: { name: error && error.name, message: error && error.message }
+                }, session.origin);
+            }
+        }, { once: true });
+        (document.body || document.documentElement).appendChild(button);
+        session.button = button;
+    }
+
+    async function handleTopPickMessage(event) {
+        const data = event.data;
+        if (!isPlayerOrigin(event.origin) || !data) return;
+
+        if (data.type === LIBREGRAB_PICK_REQUEST) {
+            if (typeof data.requestId !== 'string' || topPickSessions.has(data.requestId)) return;
+            const session = {
+                requestId: data.requestId,
+                source: event.source,
+                origin: event.origin,
+                filename: String(data.filename || 'audiobook.mp3').replace(/[\\/:*?"<>|\u0000-\u001f\u007f]+/g, '_').slice(0, 180) || 'audiobook.mp3',
+                types: Array.isArray(data.types) ? data.types : null,
+                fileHandle: null,
+                writable: null,
+                button: null
+            };
+            topPickSessions.set(session.requestId, session);
+            showTopFramePickButton(session);
+            return;
+        }
+
+        const session = topPickSessions.get(data.requestId);
+        if (!session || event.source !== session.source) return;
+
+        if (data.type === LIBREGRAB_WRITE_CHUNK) {
+            try {
+                if (!session.writable) throw new Error('Save file was not chosen yet');
+                if (!(data.arrayBuffer instanceof ArrayBuffer)) throw new Error('Missing file chunk');
+                await session.writable.write(new Uint8Array(data.arrayBuffer));
+                session.source.postMessage({
+                    type: LIBREGRAB_WRITE_ACK,
+                    requestId: session.requestId,
+                    seq: data.seq,
+                    ok: true
+                }, session.origin);
+            } catch (error) {
+                session.source.postMessage({
+                    type: LIBREGRAB_WRITE_ACK,
+                    requestId: session.requestId,
+                    seq: data.seq,
+                    ok: false,
+                    error: { name: error && error.name, message: error && error.message }
+                }, session.origin);
+            }
+            return;
+        }
+
+        if (data.type === LIBREGRAB_WRITE_CLOSE) {
+            try {
+                if (session.writable) await session.writable.close();
+                session.source.postMessage({
+                    type: LIBREGRAB_WRITE_CLOSE_ACK,
+                    requestId: session.requestId,
+                    ok: true,
+                    name: (session.fileHandle && session.fileHandle.name) || session.filename
+                }, session.origin);
+            } catch (error) {
+                session.source.postMessage({
+                    type: LIBREGRAB_WRITE_CLOSE_ACK,
+                    requestId: session.requestId,
+                    ok: false,
+                    error: { name: error && error.name, message: error && error.message }
+                }, session.origin);
+            } finally {
+                if (session.button) session.button.remove();
+                topPickSessions.delete(session.requestId);
+            }
+        }
+    }
+
+    function handleIframePickMessage(event) {
+        const data = event.data;
+        if (!data || event.source !== window.top) return;
+
+        if (data.type === LIBREGRAB_PICK_RESULT) {
+            const pending = pendingIframePicks.get(data.requestId);
+            if (!pending) return;
+            clearTimeout(pending.timeoutId);
+            pendingIframePicks.delete(data.requestId);
+            if (data.ok) pending.resolve({ name: data.name || 'audiobook.mp3', parentOrigin: event.origin });
+            else if (data.cancelled) pending.reject(new DOMException('Save cancelled by user.', 'AbortError'));
+            else pending.reject(new Error((data.error && data.error.message) || 'Top-level file picker failed'));
+            return;
+        }
+
+        if (data.type === LIBREGRAB_WRITE_ACK) {
+            const pending = pendingIframeWrites.get(data.requestId + ':' + data.seq);
+            if (!pending) return;
+            pendingIframeWrites.delete(data.requestId + ':' + data.seq);
+            if (data.ok) pending.resolve();
+            else pending.reject(new Error((data.error && data.error.message) || 'Top-level write failed'));
+            return;
+        }
+
+        if (data.type === LIBREGRAB_WRITE_CLOSE_ACK) {
+            const pending = pendingIframeWrites.get(data.requestId + ':close');
+            if (!pending) return;
+            pendingIframeWrites.delete(data.requestId + ':close');
+            if (data.ok) pending.resolve(data.name);
+            else pending.reject(new Error((data.error && data.error.message) || 'Top-level close failed'));
+        }
+    }
+
+    window.addEventListener('message', event => {
+        if (isTopFrame) handleTopPickMessage(event).catch(err => console.error('LibreGRAB top-frame picker failed', err));
+        else handleIframePickMessage(event);
+    });
+
+    async function createProxySaveHandle(suggestedName, types) {
+        let origin = iframeParentOrigin();
+        const targetOrigin = (origin && isLibbyFamilyOrigin(origin)) ? origin : '*';
+        if (typeof downloadElem !== 'undefined' && downloadElem) {
+            downloadElem.innerHTML += 'Click <b>LibreGRAB: Choose save location</b> on the main Libby page to open the file picker.<br>';
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        }
+        const requestId = libregrabRequestId();
+        const picked = await new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                pendingIframePicks.delete(requestId);
+                reject(new Error('Timed out waiting for the top-level file picker'));
+            }, 10 * 60 * 1000);
+            pendingIframePicks.set(requestId, { resolve, reject, timeoutId });
+            window.top.postMessage({
+                type: LIBREGRAB_PICK_REQUEST,
+                requestId,
+                filename: suggestedName,
+                types
+            }, targetOrigin);
+        });
+        const name = picked.name;
+        origin = picked.parentOrigin || origin;
+        if (!origin || !isLibbyFamilyOrigin(origin)) {
+            throw new Error('Unrecognized top-level Libby/OverDrive origin: ' + origin);
+        }
+
+        let seq = 0;
+        return {
+            name,
+            async createWritable() {
+                return {
+                    async write(data) {
+                        const arrayBuffer = await toArrayBuffer(data);
+                        const thisSeq = ++seq;
+                        await new Promise((resolve, reject) => {
+                            pendingIframeWrites.set(requestId + ':' + thisSeq, { resolve, reject });
+                            window.top.postMessage({
+                                type: LIBREGRAB_WRITE_CHUNK,
+                                requestId,
+                                seq: thisSeq,
+                                arrayBuffer
+                            }, origin, [arrayBuffer]);
+                        });
+                    },
+                    async close() {
+                        await new Promise((resolve, reject) => {
+                            pendingIframeWrites.set(requestId + ':close', { resolve, reject });
+                            window.top.postMessage({
+                                type: LIBREGRAB_WRITE_CLOSE,
+                                requestId
+                            }, origin);
+                        });
+                    },
+                    abort() {
+                        return this.close();
+                    }
+                };
+            },
+            async createSyncAccessHandle() {
+                throw new Error('createSyncAccessHandle is not available across frames');
+            }
+        };
+    }
+
+    async function pickSaveFile(suggestedName, types) {
+        if (window.top !== window.self) {
+            return await createProxySaveHandle(suggestedName, types);
+        }
+        const w = pageWindow();
+        const picker = w.showSaveFilePicker;
+        if (typeof picker !== 'function') {
+            throw new Error('File System Access API is not available on this window');
+        }
+        return picker.call(w, { suggestedName, types });
+    }
     // Since the ffmpeg.js file is 50mb, it slows the page down too much
     // to be in a "require" attribute, so we load it in async
     function addFFmpegJs(){
@@ -580,6 +960,48 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
     let downloadState = -1;
     let ffmpeg = null;
+    async function tagFinalAudiobookMp3(arrayBuffer, metadata, coverBlob, urls) {
+        const ID3Writer = await loadID3Writer();
+        const writer = new ID3Writer(arrayBuffer);
+        const title = metadata && metadata.title ? String(metadata.title) : String(BIF.map.title.main || 'Audiobook');
+        const author = getAuthorString();
+        const narrator = getNarratorString();
+        const durationMs = Math.round(urls.reduce((total, url) => total + (Number(url.duration) || 0), 0) * 1000);
+        const chapterCount = metadata && Array.isArray(metadata.chapters) ? metadata.chapters.length : 0;
+
+        // This is one merged audiobook file, not one track per Libby delivery part.
+        // browser-id3-writer removes the old ID3 tag, including the first part's
+        // "Opening Credits" title and its delivery-part-based TRCK value.
+        writer.setFrame('TIT2', title);
+        writer.setFrame('TALB', title);
+        if (author) {
+            writer.setFrame('TPE1', [author]);
+            writer.setFrame('TPE2', [author]);
+        }
+        writer.setFrame('TRCK', '1/1');
+        if (durationMs > 0) writer.setFrame('TLEN', durationMs);
+        if (narrator) writer.setFrame('TXXX', {
+            description: 'Narrator',
+            value: narrator,
+        });
+        writer.setFrame('COMM', {
+            description: 'LibreGRAB',
+            language: 'eng',
+            text: chapterCount
+                ? 'Audiobook with ' + chapterCount + ' logical chapters.'
+                : 'Audiobook exported by LibreGRAB.',
+        });
+        if (coverBlob) {
+            writer.setFrame('APIC', {
+                type: 3,
+                data: await coverBlob.arrayBuffer(),
+                description: 'Cover',
+            });
+        }
+        writer.addTag();
+        return writer.arrayBuffer;
+    }
+
     async function createAndDownloadMp3(urls){
         let metadata = getMetadata();
         let coverBlob = null;
@@ -596,15 +1018,13 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         const filename = getAuthorString() + ' - ' + BIF.map.title.main + '.mp3';
 
         // Try streaming via File System Access API
-        if ('showSaveFilePicker' in window) {
+        const w = pageWindow();
+        if (typeof w.showSaveFilePicker === 'function') {
             try {
-                const handle = await window.showSaveFilePicker({
-                    suggestedName: filename,
-                    types: [{
-                        description: 'MP3 Audio',
-                        accept: {'audio/mpeg': ['.mp3']},
-                    }],
-                });
+                const handle = await pickSaveFile(filename, [{
+                    description: 'MP3 Audio',
+                    accept: {'audio/mpeg': ['.mp3']},
+                }]);
                 await buildAudiobookSingleMp3(urls, metadata, coverBlob, handle);
                 downloadState = -1;
                 downloadElem.innerHTML = "";
@@ -616,7 +1036,11 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                     downloadState = -1;
                     return;
                 }
-                console.error('Streaming download failed:', err);
+                if (err && err.name === "LibreGrabSkipPicker") {
+                // Expected: cross-origin player iframes cannot open a file picker.
+            } else {
+                console.error("Streaming download failed:", err);
+            }
                 downloadElem.innerHTML += "Streaming failed, using fallback...<br>";
             }
         }
@@ -697,14 +1121,32 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 : [])
             .concat(["out.mp3"]));
 
-        let blob_url = await ffmpeg.readFileToUrl("out.mp3");
-
-        const link = document.createElement('a');
-        link.href = blob_url;
-        link.download = getAuthorString() + ' - ' + BIF.map.title.main + '.mp3';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
+        const blob_url = await ffmpeg.readFileToUrl("out.mp3");
+        const finalMp3ArrayBuffer = await fetch(blob_url).then(r => {
+            if (!r.ok) throw new Error('Could not read generated MP3: HTTP ' + r.status);
+            return r.arrayBuffer();
+        });
+        const taggedMp3ArrayBuffer = await tagFinalAudiobookMp3(
+            finalMp3ArrayBuffer,
+            metadata,
+            coverBlob,
+            urls
+        );
+        const outputBlob = new Blob([taggedMp3ArrayBuffer], { type: 'audio/mpeg' });
+        const outputFilename = getAuthorString() + ' - ' + BIF.map.title.main + '.mp3';
+        downloadElem.innerHTML += "Sending MP3 to the top-level download handler…<br>";
+        try {
+            await requestSaveFromTopFrame(outputBlob, outputFilename, "audio/mpeg");
+            downloadElem.innerHTML += "<b>Download complete!</b><br>";
+        } catch (error) {
+            if (error && error.name === "AbortError") {
+                downloadElem.innerHTML += "Download cancelled by user.<br>";
+            } else {
+                console.error("Top-level save failed", error);
+                downloadElem.innerHTML += "<b>Save failed:</b> " + String(error && error.message ? error.message : error) + "<br>";
+            }
+        }
+        URL.revokeObjectURL(blob_url);
 
         downloadState = -1;
         downloadElem.innerHTML = "";
