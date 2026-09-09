@@ -2,7 +2,7 @@
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
 // @version       2026-06-01
-// @description   Download all the booty!
+// @description   Download all the booty! - ID3 tagging enabled
 // @author        PsychedelicPalimpsest
 // @license       MIT
 // @supportURL    https://github.com/PsychedelicPalimpsest/LibbyRip/issues
@@ -56,6 +56,23 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         if (window.downloadZip) return window.downloadZip;
         if (window.__libregrabClientZipReady) return window.__libregrabClientZipReady;
         throw new Error("client-zip did not load");
+    }
+    let _ID3WriterPromise = null;
+    function loadID3Writer() {
+        if (!_ID3WriterPromise) {
+            _ID3WriterPromise = import('https://cdn.jsdelivr.net/npm/browser-id3-writer@6/+esm')
+                .then(mod => {
+                    const Writer = mod.ID3Writer;
+                    if (typeof Writer !== 'function') throw new Error('ID3Writer named export not found on module');
+                    return Writer;
+                });
+        }
+        return _ID3WriterPromise;
+    }
+
+    function logLine(html) {
+        downloadElem.innerHTML += html;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
     }
     const CSS = `
     .pNav{
@@ -219,6 +236,10 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         return BIF.map.creator.filter(creator => creator.role === 'author').map(creator => creator.name).join(", ");
     }
 
+    function getNarratorString(){
+        return BIF.map.creator.filter(creator => creator.role === 'narrator').map(creator => creator.name).join(", ");
+    }
+
     function getMetadata(){
         let spineToIndex = BIF.map.spine.map((x)=>x["-odread-original-path"]);
         let metadata = {
@@ -307,6 +328,37 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         return toc;
     }
 
+    async function tagChapterMp3(arrayBuffer, { book, displayTitle, author, narrator, seriesName, seriesIndex, chapterNumber, totalChapters, durationMs, coverBlob, progress }) {
+        try {
+            const ID3Writer = await loadID3Writer();
+            const writer = new ID3Writer(arrayBuffer);
+
+            const chapterTitle = chapterNumber === 0 ? `${displayTitle} - Opening Credits` : `Chapter ${chapterNumber}`;
+            writer.setFrame('TIT2', chapterTitle);
+            writer.setFrame('TALB', displayTitle);
+            writer.setFrame('TPE1', [author]);
+            writer.setFrame('TPE2', narrator);
+            writer.setFrame('TCOM', [narrator]);
+            writer.setFrame('TRCK', totalChapters ? `${chapterNumber}/${totalChapters}` : String(chapterNumber));
+            if (seriesIndex) writer.setFrame('TPOS', String(seriesIndex));
+            if (book.street_date) {
+                const yearMatch = String(book.street_date).match(/^(\d{4})/);
+                if (yearMatch) writer.setFrame('TYER', yearMatch[1]);
+            }
+            if (durationMs) writer.setFrame('TLEN', String(Math.round(durationMs)));
+            if (coverBlob) {
+                const coverArrayBuffer = await coverBlob.arrayBuffer();
+                writer.setFrame('APIC', { type: 3, data: coverArrayBuffer, description: 'Cover' });
+            }
+
+            writer.addTag();
+            return new Blob([writer.arrayBuffer], { type: 'audio/mpeg' });
+        } catch (e) {
+            if (progress) progress(`  NOTE: ID3 tagging failed for chapter ${chapterNumber} (file kept untagged): ${e.message}`);
+            return new Blob([arrayBuffer], { type: 'audio/mpeg' });
+        }
+    }
+
     let downloadState = -1;
     let ffmpeg = null;
     async function createAndDownloadMp3(urls){
@@ -315,41 +367,55 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.innerHTML += "Downloading mp3 files <br>";
         await ffmpeg.writeFile("chapters.txt", generateTOCFFmpeg(metadata));
 
-
-        let fetchPromises = urls.map(async (url) => {
-            // Download the mp3
-            const response = await fetch(url.url);
-            const blob = await response.blob();
-
-            // Dump it into ffmpeg (We do the request here as not to bog down the worker thread)
-            const blob_url = URL.createObjectURL(blob);
-            await ffmpeg.writeFileFromUrl((url.index + 1) + ".mp3", blob_url);
-            URL.revokeObjectURL(blob_url);
-
-
-            downloadElem.innerHTML += `Download of disk ${url.index + 1} complete! <br>`
-            downloadElem.scrollTo(0, downloadElem.scrollHeight);
-        });
-
+        let coverBlob = null;
         let coverName = null;
 
-        if (metadata.coverUrl){
+        if (metadata.coverUrl) {
             console.log(metadata.coverUrl);
             const csplit = metadata.coverUrl.split(".");
             const response = await fetch(metadata.coverUrl);
-            const blob = await response.blob();
-
+            coverBlob = await response.blob();
             coverName = "cover." + csplit[csplit.length-1];
-
-            const blob_url = URL.createObjectURL(blob);
+            const blob_url = URL.createObjectURL(coverBlob);
             await ffmpeg.writeFileFromUrl(coverName, blob_url);
             URL.revokeObjectURL(blob_url);
+            downloadElem.innerHTML += "Cover downloaded <br>";
         }
 
+        let fetchPromises = urls.map(async (url) => {
+            const progress = (msg) => downloadElem.innerHTML += msg + "<br>";
+
+            // Download the mp3 as ArrayBuffer for tagging
+            const response = await fetch(url.url);
+            const arrayBuffer = await response.arrayBuffer();
+
+            // Tag the chapter
+            const taggedBlob = await tagChapterMp3(arrayBuffer, {
+                book: BIF.map,
+                displayTitle: BIF.map.title.main,
+                author: getAuthorString(),
+                narrator: getNarratorString(),
+                seriesName: null,
+                seriesIndex: null,
+                chapterNumber: url.index,
+                totalChapters: urls.length,
+                durationMs: url.duration * 1000,
+                coverBlob,
+                progress
+            });
+
+            // Dump it into ffmpeg (We do the request here as not to bog down the worker thread)
+            const blob_url = URL.createObjectURL(taggedBlob);
+            await ffmpeg.writeFileFromUrl((url.index + 1) + ".mp3", blob_url);
+            URL.revokeObjectURL(blob_url);
+
+            downloadElem.innerHTML += `Download of disk ${url.index + 1} complete! <br>`;
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        });
 
         await Promise.all(fetchPromises);
 
-        downloadElem.innerHTML += `<br><b>Downloads complete!</b> Now combining them together! (This might take a <b><i>minute</i></b>) <br> Transcode progress: <span id="mp3Progress">0</span> hours in to audiobook<br>`
+        downloadElem.innerHTML += `<br><b>Downloads complete!</b> Now combining them together! (This might take a <b><i>minute</i></b>) <br> Transcode progress: <span id="mp3Progress">0</span> hours in to audiobook<br>`;
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
         let files = "";
@@ -470,11 +536,35 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     async function createAndDownloadZip(urls, addMeta) {
         const files = [];
 
+        let coverBlob = null;
+        if (BIF.map.title && BIF.map.title.main) {
+            const metadata = getMetadata();
+            if (metadata.coverUrl) {
+                const response = await fetch(metadata.coverUrl);
+                coverBlob = await response.blob();
+            }
+        }
+
         // Fetch all files and add them to the files array
         const fetchPromises = urls.map(async (url) => {
             const response = await fetch(url.url);
-            const blob = await response.blob();
+            const arrayBuffer = await response.arrayBuffer();
             const filename = "Part " + paddy(url.index + 1, 3) + ".mp3";
+
+            const progress = (msg) => downloadElem.innerHTML += msg + "<br>";
+            const taggedBlob = await tagChapterMp3(arrayBuffer, {
+                book: BIF.map,
+                displayTitle: BIF.map.title.main,
+                author: getAuthorString(),
+                narrator: getNarratorString(),
+                seriesName: null,
+                seriesIndex: null,
+                chapterNumber: url.index,
+                totalChapters: urls.length,
+                durationMs: url.duration * 1000,
+                coverBlob,
+                progress
+            });
 
             let partElem = document.createElement("div");
             partElem.textContent = "Download of "+ filename + " complete";
@@ -485,7 +575,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
             return {
                 name: filename,
-                input: blob
+                input: taggedBlob
             };
         });
 
@@ -571,6 +661,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
         buildPirateUi();
         initFFmpeg().catch(console.error);
+        loadID3Writer()
+            .then(() => logLine("ID3 tagging library loaded OK.<br>"))
+            .catch(e => logLine(`WARNING: ID3 tagging library failed to load (chapters will be saved untagged): ${e.message}<br>`));
     }
 
 
