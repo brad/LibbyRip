@@ -887,7 +887,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
         const writable = await handle.createWritable();
-        const totalChapters = urls.length;
+        const totalChapters = metadata.chapters ? metadata.chapters.length : urls.length;
 
         let totalFrames = 0;
         let totalBytes = 0;
@@ -1056,6 +1056,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         }
 
         downloadElem.innerHTML += "Downloading mp3 files <br>";
+        const totalLogicalChapters = metadata.chapters ? metadata.chapters.length : urls.length;
         let fetchPromises = urls.map(async (url) => {
             const progress = (msg) => downloadElem.innerHTML += msg + "<br>";
 
@@ -1070,7 +1071,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 seriesName: null,
                 seriesIndex: null,
                 chapterNumber: url.index,
-                totalChapters: urls.length,
+                totalChapters: totalLogicalChapters,
                 durationMs: url.duration * 1000,
                 coverBlob,
                 progress
@@ -1106,7 +1107,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             "-i", "chapters.txt"]
             .concat(coverName ? ["-i", coverName] : [])
             .concat([
-                "-map_metadata", "1",
+                "-map_metadata", "-1",
                 "-codec", "copy",
                 "-map", "0:a",
                 "-metadata", `title=${metadata.title}`,
