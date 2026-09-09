@@ -655,7 +655,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         return chapterNumber === 0 ? `${displayTitle} - Opening Credits` : `Chapter ${chapterNumber}`;
     }
 
-    function buildBookId3Tag({ book, displayTitle, author, narrator, seriesIndex, chapters, durationByChapter, coverBytes, coverMime }) {
+    function buildBookId3Tag({ book, displayTitle, author, narrator, seriesName, seriesIndex, chapters, durationByChapter, coverBytes, coverMime }) {
         let cursor = 0;
         const chapFrames = [];
         const childIds = [];
@@ -682,12 +682,14 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             frames.push(textFrame('TCOM', narrator));
         }
         if (seriesIndex) frames.push(textFrame('TPOS', String(seriesIndex)));
+        if (seriesName) frames.push(textFrame('TXXX', { description: 'Series', value: seriesName }));
         if (book.street_date) {
             const yearMatch = String(book.street_date).match(/^(\d{4})/);
             if (yearMatch) frames.push(textFrame('TYER', yearMatch[1]));
         }
         if (cursor) frames.push(textFrame('TLEN', String(Math.round(cursor))));
         if (book.description) frames.push(commFrame(book.description));
+        frames.push(commFrame('Audiobook exported by LibreGRAB from Libby.', 'eng'));
         if (coverBytes && coverBytes.length) frames.push(apicFrame(coverBytes, coverMime));
         if (childIds.length) {
             frames.push(ctocFrame('toc', childIds, 'Table of Contents'));
@@ -872,7 +874,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         ];
     }
 
-    function tagChapterMp3(arrayBuffer, { book, displayTitle, author, narrator, seriesIndex, chapterNumber, totalChapters, durationMs, coverBytes, coverMime, progress }) {
+    function tagChapterMp3(arrayBuffer, { book, displayTitle, author, narrator, seriesName, seriesIndex, chapterNumber, totalChapters, durationMs, coverBytes, coverMime, progress }) {
         try {
             const frames = [
                 textFrame('TIT2', chapterTitleFor(chapterNumber, displayTitle)),
@@ -887,6 +889,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 frames.push(textFrame('TCOM', narrator));
             }
             if (seriesIndex) frames.push(textFrame('TPOS', String(seriesIndex)));
+            if (seriesName) frames.push(textFrame('TXXX', { description: 'Series', value: seriesName }));
             if (book.street_date) {
                 const yearMatch = String(book.street_date).match(/^(\d{4})/);
                 if (yearMatch) frames.push(textFrame('TYER', yearMatch[1]));
@@ -916,6 +919,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             displayTitle,
             author,
             narrator,
+            seriesName: (BIF.map.series && BIF.map.series[0]) || null,
             seriesIndex: null,
             chapters: metadata.chapters || [],
             durationByChapter: Object.fromEntries(urls.map(u => [u.index, u.duration * 1000])),
@@ -1093,6 +1097,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                         displayTitle: BIF.map.title.main,
                         author: getAuthorString(),
                         narrator: getNarratorString(),
+                        seriesName: (BIF.map.series && BIF.map.series[0]) || null,
                         seriesIndex: null,
                         chapterNumber: url.index,
                         totalChapters: totalLogicalChapters,
@@ -1211,6 +1216,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                         displayTitle: BIF.map.title.main,
                         author: getAuthorString(),
                         narrator: getNarratorString(),
+                        seriesName: (BIF.map.series && BIF.map.series[0]) || null,
                         seriesIndex: null,
                         chapterNumber: url.index,
                         totalChapters: totalLogicalChapters,
