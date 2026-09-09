@@ -359,37 +359,285 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         }
     }
 
+    // Parse an MPEG audio frame header and return frame metadata
+    function parseMpegFrameHeader(bytes, offset) {
+        if (offset + 4 > bytes.length) return null;
+        const frameSync = (bytes[offset] << 4) | (bytes[offset + 1] >> 4);
+        if (frameSync !== 0xFFF) return null;
+
+        const version = (bytes[offset + 1] >> 3) & 0x03; // 0=MPEG2.5, 1=reserved, 2=MPEG2, 3=MPEG1
+        const layer = (bytes[offset + 1] >> 1) & 0x03; // 0=reserved, 1=Layer3, 2=Layer2, 3=Layer1
+        if (version === 1 || layer === 0) return null;
+
+        const bitrateIndex = (bytes[offset + 2] >> 4) & 0x0F;
+        const samplingRateIndex = (bytes[offset + 2] >> 2) & 0x03;
+        const channelMode = (bytes[offset + 3] >> 6) & 0x03;
+        const isMpeg1 = version === 3 || version === 2; // MPEG-1 or MPEG-2
+        const isLayer3 = layer === 1;
+
+        const bitrateTable = isMpeg1 ? [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
+            [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
+            [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],
+            [0, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 0],
+            [0, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 0],
+            [0, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 0],
+            [0, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 0],
+            [0, 160, 160, 160, 160, 160, 160, 160, 160, 160, 160, 160, 160, 160, 160, 0],
+            [0, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 192, 0],
+            [0, 224, 224, 224, 224, 224, 224, 224, 224, 224, 224, 224, 224, 224, 224, 0],
+            [0, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 0],
+            [0, 288, 288, 288, 288, 288, 288, 288, 288, 288, 288, 288, 288, 288, 288, 0],
+            [0, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 0],
+            [0, 352, 352, 352, 352, 352, 352, 352, 352, 352, 352, 352, 352, 352, 352, 0],
+            [0, 384, 384, 384, 384, 384, 384, 384, 384, 384, 384, 384, 384, 384, 384, 0]
+        ] : layer === 1 ? [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 32, 40, 48, 56, 64, 72, 80, 88, 96, 112, 128, 144, 160, 0, 0],
+            [0, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]
+        ] : layer === 2 ? [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448],
+            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224]
+        ] : [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        ];
+
+        const bitrateKbps = bitrateTable[version][bitrateIndex];
+        const samplingRateTable = isMpeg1 ? [16000, 44100, 48000, 32000] : [8000, 16000, 22050, 11025];
+        const samplingRate = samplingRateTable[samplingRateIndex];
+        const frameLength = samplingRate === 0 ? 0 : Math.floor(144 * bitrateKbps * 1000 / samplingRate) + 1;
+
+        // Side information length (bytes after the 4-byte frame header)
+        let sideInfoLength = 0;
+        if (isMpeg1 && layer === 3) {
+            sideInfoLength = channelMode === 3 ? 17 : 32;
+        } else if (isMpeg1 && layer === 2) {
+            sideInfoLength = channelMode === 3 ? 17 : 32;
+        } else if (!isMpeg1 && layer === 3) {
+            sideInfoLength = channelMode === 3 ? 9 : 17;
+        } else if (!isMpeg1 && layer === 2) {
+            sideInfoLength = channelMode === 3 ? 9 : 17;
+        }
+
+        return {
+            frameLength,
+            sideInfoLength,
+            channelMode
+        };
+    }
+
+    // Find the Xing/LAME header within the first audio frame
+    function findXingHeaderOffset(bytes, audioStartOffset) {
+        const header = parseMpegFrameHeader(bytes, audioStartOffset);
+        if (!header) return -1;
+
+        const xingOffset = audioStartOffset + 4 + header.sideInfoLength;
+        if (xingOffset + 4 > bytes.length) return -1;
+
+        const tag = String.fromCharCode(bytes[xingOffset], bytes[xingOffset + 1], bytes[xingOffset + 2], bytes[xingOffset + 3]);
+        if (tag !== "Xing" && tag !== "Info") return -1;
+
+        const flags = (bytes[xingOffset + 4] << 24) | (bytes[xingOffset + 5] << 16) | (bytes[xingOffset + 6] << 8) | bytes[xingOffset + 7];
+        return {
+            offset: xingOffset,
+            flags,
+            hasFrames: (flags & 0x01) !== 0,
+            hasBytes: (flags & 0x02) !== 0
+        };
+    }
+
+    // Count MPEG frames in an ArrayBuffer (for Xing header total frame count)
+    function countMpegFrames(arrayBuffer) {
+        const bytes = new Uint8Array(arrayBuffer);
+        let count = 0;
+        for (let i = 0; i < bytes.length - 3; i++) {
+            if (bytes[i] === 0xFF && (bytes[i + 1] & 0xE0) === 0xE0) {
+                const header = parseMpegFrameHeader(bytes, i);
+                if (header && header.frameLength > 0) {
+                    count++;
+                    i += header.frameLength - 1;
+                }
+            }
+        }
+        return count;
+    }
+
+    // Patch the Xing header at the end of the stream with total frame count and byte count
+    async function patchXingHeader(handle, xingInfo) {
+        if (!xingInfo || xingInfo.offset === -1) return;
+
+        try {
+            const syncHandle = await handle.createSyncAccessHandle();
+            syncHandle.seek(xingInfo.offset + 8);
+            syncHandle.write(new DataView(new ArrayBuffer(4)).setUint32(0, xingInfo.totalFrames, false).buffer);
+            if (xingInfo.hasBytes) {
+                const bytesView = new DataView(new ArrayBuffer(4));
+                bytesView.setUint32(0, xingInfo.totalBytes, false);
+                syncHandle.write(bytesView.buffer);
+            }
+            syncHandle.flush();
+            syncHandle.close();
+        } catch (err) {
+            console.warn("Could not patch Xing header:", err);
+        }
+}
+
+    // Find the end of ID3v2 tag to get to the start of audio data
+    function findID3v2End(bytes) {
+        // Check if there's an ID3v2 tag at the start
+        if (bytes.length >= 10 && 
+            bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+            // ID3v2 tag size is encoded as 4 bytes, each using only 7 bits
+            const size = ((bytes[6] & 0x7F) << 21) |
+                        ((bytes[7] & 0x7F) << 14) |
+                        ((bytes[8] & 0x7F) << 7) |
+                        (bytes[9] & 0x7F);
+            return 10 + size; // Skip the 10-byte header + tag size
+        }
+        return 0; // No ID3v2 tag
+    }
+    
+    // Main streaming function: writes chapters sequentially to a single file
+    async function buildAudiobookSingleMp3(urls, metadata, coverBlob, handle) {
+        downloadElem.innerHTML = "<b>Downloading and tagging chapters...</b><br>";
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+        const writable = await handle.createWritable();
+        const totalChapters = urls.length;
+
+        let totalFrames = 0;
+        let totalBytes = 0;
+        let firstXingInfo = null;
+
+        for (let i = 0; i < totalChapters; i++) {
+            const url = urls[i];
+            const progress = (msg) => downloadElem.innerHTML += msg + "<br>";
+
+            // Fetch chapter audio (ArrayBuffer)
+            const response = await fetch(url.url);
+            const arrayBuffer = await response.arrayBuffer();
+
+            // Tag the chapter with ID3 metadata (same as current)
+            const taggedBlob = await tagChapterMp3(arrayBuffer, {
+                book: BIF.map,
+                displayTitle: BIF.map.title.main,
+                author: getAuthorString(),
+                narrator: getNarratorString(),
+                seriesName: null,
+                seriesIndex: null,
+                chapterNumber: url.index,
+                totalChapters: totalChapters,
+                durationMs: url.duration * 1000,
+                coverBlob,
+                progress
+            });
+
+            const taggedArrayBuffer = await taggedBlob.arrayBuffer();
+            const bytes = new Uint8Array(taggedArrayBuffer);
+
+            // Strip leading ID3 tag / Xing frames if needed
+            const id3End = findID3v2End(bytes);
+            const audioStartOffset = id3End;
+
+            if (i === 0) {
+                const xingInfo = findXingHeaderOffset(bytes, audioStartOffset);
+                if (xingInfo && xingInfo.offset !== -1) {
+                    firstXingInfo = {
+                        offset: xingInfo.offset,
+                        flags: xingInfo.flags,
+                        hasFrames: xingInfo.hasFrames,
+                        hasBytes: xingInfo.hasBytes,
+                        totalFrames: 0,
+                        totalBytes: 0
+                    };
+                }
+            }
+
+            // Write audio data directly to the writable stream
+            await writable.write(bytes);
+            totalBytes += taggedArrayBuffer.byteLength;
+            totalFrames += countMpegFrames(taggedArrayBuffer);
+
+            downloadElem.innerHTML += `Processed chapter ${i + 1}/${totalChapters}<br>`;
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        }
+
+        // Patch Xing header to complete the stream
+        if (firstXingInfo) {
+            firstXingInfo.totalFrames = totalFrames;
+            firstXingInfo.totalBytes = totalBytes;
+            await patchXingHeader(handle, firstXingInfo);
+        }
+
+        await writable.close();
+        downloadElem.innerHTML += `<b>Done! Saved: ${handle.name}</b><br>`;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+    }
+
     let downloadState = -1;
     let ffmpeg = null;
     async function createAndDownloadMp3(urls){
-        await initFFmpeg();
         let metadata = getMetadata();
-        downloadElem.innerHTML += "Downloading mp3 files <br>";
-        await ffmpeg.writeFile("chapters.txt", generateTOCFFmpeg(metadata));
-
         let coverBlob = null;
         let coverName = null;
 
         if (metadata.coverUrl) {
-            console.log(metadata.coverUrl);
             const csplit = metadata.coverUrl.split(".");
             const response = await fetch(metadata.coverUrl);
             coverBlob = await response.blob();
             coverName = "cover." + csplit[csplit.length-1];
-            const blob_url = URL.createObjectURL(coverBlob);
-            await ffmpeg.writeFileFromUrl(coverName, blob_url);
-            URL.revokeObjectURL(blob_url);
             downloadElem.innerHTML += "Cover downloaded <br>";
         }
 
+        const filename = getAuthorString() + ' - ' + BIF.map.title.main + '.mp3';
+
+        // Try streaming via File System Access API
+        if ('showSaveFilePicker' in window) {
+            try {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: filename,
+                    types: [{
+                        description: 'MP3 Audio',
+                        accept: {'audio/mpeg': ['.mp3']},
+                    }],
+                });
+                await buildAudiobookSingleMp3(urls, metadata, coverBlob, handle);
+                downloadState = -1;
+                downloadElem.innerHTML = "";
+                downloadElem.classList.remove("active");
+                return;
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    downloadElem.innerHTML += "Download cancelled by user.<br>";
+                    downloadState = -1;
+                    return;
+                }
+                console.error('Streaming download failed:', err);
+                downloadElem.innerHTML += "Streaming failed, using fallback...<br>";
+            }
+        }
+
+        // Fallback: original FFmpeg concat method
+        await initFFmpeg();
+        await ffmpeg.writeFile("chapters.txt", generateTOCFFmpeg(metadata));
+
+        if (coverBlob && coverName) {
+            const blob_url = URL.createObjectURL(coverBlob);
+            await ffmpeg.writeFileFromUrl(coverName, blob_url);
+            URL.revokeObjectURL(blob_url);
+        }
+
+        downloadElem.innerHTML += "Downloading mp3 files <br>";
         let fetchPromises = urls.map(async (url) => {
             const progress = (msg) => downloadElem.innerHTML += msg + "<br>";
 
-            // Download the mp3 as ArrayBuffer for tagging
             const response = await fetch(url.url);
             const arrayBuffer = await response.arrayBuffer();
 
-            // Tag the chapter
             const taggedBlob = await tagChapterMp3(arrayBuffer, {
                 book: BIF.map,
                 displayTitle: BIF.map.title.main,
@@ -404,7 +652,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 progress
             });
 
-            // Dump it into ffmpeg (We do the request here as not to bog down the worker thread)
             const blob_url = URL.createObjectURL(taggedBlob);
             await ffmpeg.writeFileFromUrl((url.index + 1) + ".mp3", blob_url);
             URL.revokeObjectURL(blob_url);
@@ -419,58 +666,50 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
         let files = "";
-
         for (let i = 0; i < urls.length; i++){
             files += `file '${i+1}.mp3'\n`
         }
         await ffmpeg.writeFile("files.txt", files);
 
         ffmpeg.setProgress((progress)=>{
-            // The progress.time feature seems to be in micro secounds
             downloadElem.querySelector("#mp3Progress").textContent = (progress.time / 1000000 / 3600).toFixed(2);
         });
         ffmpeg.setLogger(console.log);
 
         await ffmpeg.exec([
-                           "-y", "-f", "concat",
-                           "-i", "files.txt",
-                           "-i", "chapters.txt"]
-                          .concat(coverName ? ["-i", coverName] : [])
-                          .concat([
-                            "-map_metadata", "1",
-                            "-codec", "copy",
-                            "-map", "0:a",
-                            "-metadata", `title=${metadata.title}`,
-                            "-metadata", `album=${metadata.title}`,
-                            "-metadata", `artist=${getAuthorString()}`,
-                            "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
-                            "-c:a", "copy"])
-                          .concat(coverName ? [
-                            "-map", "2:v",
-                            "-metadata:s:v", "title=Album cover",
-                            "-metadata:s:v", "comment=Cover (front)"]
-                            : [])
-                            .concat(["out.mp3"]));
-
-
+            "-y", "-f", "concat",
+            "-i", "files.txt",
+            "-i", "chapters.txt"]
+            .concat(coverName ? ["-i", coverName] : [])
+            .concat([
+                "-map_metadata", "1",
+                "-codec", "copy",
+                "-map", "0:a",
+                "-metadata", `title=${metadata.title}`,
+                "-metadata", `album=${metadata.title}`,
+                "-metadata", `artist=${getAuthorString()}`,
+                "-metadata", `encoded_by=LibbyRip/LibreGRAB`,
+                "-c:a", "copy"])
+            .concat(coverName ? [
+                "-map", "2:v",
+                "-metadata:s:v", "title=Album cover",
+                "-metadata:s:v", "comment=Cover (front)"]
+                : [])
+            .concat(["out.mp3"]));
 
         let blob_url = await ffmpeg.readFileToUrl("out.mp3");
 
         const link = document.createElement('a');
         link.href = blob_url;
-
         link.download = getAuthorString() + ' - ' + BIF.map.title.main + '.mp3';
         document.body.appendChild(link);
         link.click();
         link.remove();
 
         downloadState = -1;
-        downloadElem.innerHTML = ""
+        downloadElem.innerHTML = "";
         downloadElem.classList.remove("active");
-
-        // Clean up the object URL
         setTimeout(() => URL.revokeObjectURL(blob_url), 100);
-
     }
 
     let ffmpegInitPromise = null;
