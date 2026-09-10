@@ -158,8 +158,11 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     const LIBREGRAB_WRITE_ACK = 'LIBREGRAB_WRITE_ACK';
     const LIBREGRAB_WRITE_CLOSE = 'LIBREGRAB_WRITE_CLOSE';
     const LIBREGRAB_WRITE_CLOSE_ACK = 'LIBREGRAB_WRITE_CLOSE_ACK';
+    const LIBREGRAB_WRITE_SEEK = 'LIBREGRAB_WRITE_SEEK';
+    const LIBREGRAB_WRITE_SEEK_ACK = 'LIBREGRAB_WRITE_SEEK_ACK';
     const pendingIframePicks = new Map();
     const pendingIframeWrites = new Map();
+    const pendingIframeSeeks = new Map();
     const topPickSessions = new Map();
 
     function libregrabRequestId() {
@@ -286,6 +289,26 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             return;
         }
 
+        if (data.type === LIBREGRAB_WRITE_SEEK) {
+            try {
+                if (!session.writable) throw new Error('Save file was not chosen yet');
+                await session.writable.seek(data.position);
+                session.source.postMessage({
+                    type: LIBREGRAB_WRITE_SEEK_ACK,
+                    requestId: session.requestId,
+                    ok: true
+                }, session.origin);
+            } catch (error) {
+                session.source.postMessage({
+                    type: LIBREGRAB_WRITE_SEEK_ACK,
+                    requestId: session.requestId,
+                    ok: false,
+                    error: { name: error && error.name, message: error && error.message }
+                }, session.origin);
+            }
+            return;
+        }
+
         if (data.type === LIBREGRAB_WRITE_CLOSE) {
             try {
                 if (session.writable) await session.writable.close();
@@ -339,6 +362,14 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             pendingIframeWrites.delete(data.requestId + ':close');
             if (data.ok) pending.resolve(data.name);
             else pending.reject(new Error((data.error && data.error.message) || 'Top-level close failed'));
+        }
+
+        if (data.type === LIBREGRAB_WRITE_SEEK_ACK) {
+            const pending = pendingIframeSeeks.get(data.requestId);
+            if (!pending) return;
+            pendingIframeSeeks.delete(data.requestId);
+            if (data.ok) pending.resolve();
+            else pending.reject(new Error((data.error && data.error.message) || 'Top-level seek failed'));
         }
     }
 
@@ -398,6 +429,17 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                             window.top.postMessage({
                                 type: LIBREGRAB_WRITE_CLOSE,
                                 requestId
+                            }, origin);
+                        });
+                    },
+                    async seek(position) {
+                        const seekRequestId = libregrabRequestId();
+                        await new Promise((resolve, reject) => {
+                            pendingIframeSeeks.set(seekRequestId, { resolve, reject });
+                            window.top.postMessage({
+                                type: LIBREGRAB_WRITE_SEEK,
+                                requestId: seekRequestId,
+                                position
                             }, origin);
                         });
                     },
