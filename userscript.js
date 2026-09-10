@@ -30,6 +30,15 @@
 // real page world.
 
 (function () {
+    // Detect page type from hostname AND pathname (for top-level libbyapp.com pages)
+    const hostname = location.hostname;
+    const pathname = location.pathname;
+    const isAudiobookHost = /^(.*\.)?listen\.(libbyapp|overdrive)\.com$/.test(hostname);
+    const isEbookHost = /^(.*\.)?read\.(libbyapp|overdrive)\.com$/.test(hostname);
+    const isLibbyTop = hostname === 'libbyapp.com' || hostname === 'overdrive.com' || /^[^.]+\.(libbyapp|overdrive)\.com$/.test(hostname);
+    const isAudiobookPage = isAudiobookHost || (isLibbyTop && /^\/open\/loan\//.test(pathname));
+    const isEbookPage = isEbookHost || (isLibbyTop && /^\/open\/reader\//.test(pathname));
+
     const clientZipReadyCode = `
 window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     window.__libregrabResolveClientZip = resolve;
@@ -37,8 +46,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 });
 `;
     function mainCode() {
+        console.log('[LibbyRip] mainCode running in page context', location.href);
 
-    const LIBREGRAB_SAVE_REQUEST = 'LIBREGRAB_SAVE_REQUEST';
+        const LIBREGRAB_SAVE_REQUEST = 'LIBREGRAB_SAVE_REQUEST';
     const LIBREGRAB_SAVE_RESULT = 'LIBREGRAB_SAVE_RESULT';
     const isTopFrame = window.top === window.self;
 
@@ -735,6 +745,40 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         <a class="pLink" id="down"> <h1> Export as MP3 </h1> </a>
         <a class="pLink" id="exp"> <h1> Export audiobook </h1> </a>
     `;
+    const CSS = `
+    .pNav{
+        background-color: red;
+        width: 100%;
+        display: flex;
+        justify-content: space-between;
+    }
+    .pLink{
+        color: blue;
+        text-decoration-line: underline;
+        padding: .25em;
+        font-size: 1em;
+    }
+    .foldMenu{
+        position: absolute;
+        width: 100%;
+        height: 0%;
+        z-index: 1000;
+
+        background-color: grey;
+        color: white;
+
+        overflow-x: hidden;
+        overflow-y: scroll;
+
+        transition: height 0.3s
+    }
+    .active{
+        height: 40%;
+        border: double;
+    }
+    .pChapLabel{
+        font-size: 2em;
+    }`;
     const chaptersMenu = `
         <h2>This book contains {CHAPTERS} chapters.</h2>
         <button class="shibui-button" style="background-color: white" id="dumpAll"> Download all </button><br>
@@ -742,7 +786,10 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     let chapterMenuElem;
 
     function buildPirateUi(){
-        // Create the nav
+        // Create the nav (with style)
+        let s = document.createElement("style");
+        s.innerHTML = CSS;
+        document.head.appendChild(s)
         let nav = document.createElement("div");
         nav.innerHTML = audioBookNav;
         nav.querySelector("#chap").onclick = viewChapters;
@@ -1357,10 +1404,20 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         setTimeout(() => URL.revokeObjectURL(downloadUrl), 100);
     }
 
+    // The "BIF" contains all the info we need to download
+    // stuff, so we wait until the page is loaded, and the
+    // BIF is present, to inject the pirate menu.
+    let intr = setInterval(()=>{
+        if (window.BIF != undefined && document.querySelector(".nav-progress-bar") != undefined){
+            clearInterval(intr);
+            BIF = window.BIF;
+        }
+    }, 25);
+
     if (typeof BIF !== 'undefined' && BIF && BIF.map) {
         buildPirateUi();
     } else {
-        console.log('BIF not ready, waiting...');
+        console.log('[LibbyRip] BIF not ready, waiting...');
         const checkBIF = setInterval(() => {
             if (typeof BIF !== 'undefined' && BIF && BIF.map) {
                 clearInterval(checkBIF);
@@ -1368,23 +1425,23 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             }
         }, 500);
     }
-
     } // end mainCode
 
-    // Inject into page context
+    console.log('[LibbyRip] Injecting mainCode');
+    // Load client-zip first
+    const zipScript = document.createElement('script');
+    zipScript.src = 'https://unpkg.com/client-zip@2.5.0/worker.js';
+    zipScript.onload = () => {
+        window.__libregrabResolveClientZip?.(window.downloadZip);
+    };
+    zipScript.onerror = () => {
+        window.__libregrabRejectClientZip?.(new Error('client-zip failed to load'));
+    };
+    document.head.appendChild(zipScript);
+
+    // Inject mainCode into page context
     const script = document.createElement('script');
     script.textContent = '(' + mainCode.toString() + ')();';
     (document.documentElement || document.head || document.body).appendChild(script);
     script.remove();
-
-    // Load client-zip in extension context (for fallback)
-    const s = document.createElement('script');
-    s.src = 'https://unpkg.com/client-zip@2.5.0/worker.js';
-    s.onload = () => {
-        window.__libregrabResolveClientZip?.(window.downloadZip);
-    };
-    s.onerror = () => {
-        window.__libregrabRejectClientZip?.(new Error('client-zip failed to load'));
-    };
-    document.head.appendChild(s);
 })();
