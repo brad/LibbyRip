@@ -896,6 +896,8 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             }
             if (durationMs) frames.push(textFrame('TLEN', String(Math.round(durationMs))));
             if (coverBytes && coverBytes.length) frames.push(apicFrame(coverBytes, coverMime));
+            if (book.description) frames.push(commFrame(book.description));
+            frames.push(commFrame('Audiobook exported by LibreGRAB from Libby.', 'eng'));
             return new Blob([writeId3(arrayBuffer, frames)], { type: 'audio/mpeg' });
         } catch (e) {
             if (progress) progress(`  NOTE: ID3 tagging failed for chapter ${chapterNumber} (file kept untagged): ${e.message}`);
