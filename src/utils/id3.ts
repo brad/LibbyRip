@@ -158,11 +158,11 @@ export function buildBookId3Tag(options: BuildBookId3TagOptions): { tag: Uint8Ar
   let cursor = 0;
   const chapFrames: Uint8Array[] = [];
   const childIds: string[] = [];
-  chapters.forEach((ch, i) => {
-    const dur = Number(durationByChapter[ch.chapter_number]) || 0;
+chapters.forEach((ch, i) => {
+    const dur = Number(durationByChapter[String(ch.chapter_number)]) || 0;
     const start = cursor;
     const end = cursor + dur;
-    const cid = i === chapters.length - 1 ? 'last' : `ch${i + 1}`;
+    const cid = i === chapters.length - 1 ? 'last' : ('ch' + (i + 1));
     childIds.push(cid);
     chapFrames.push(chapFrame(cid, start, end, chapterTitleFor(ch.chapter_number, displayTitle)));
     cursor = end;
