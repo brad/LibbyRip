@@ -5,12 +5,18 @@
   "scripts": {
     "dev": "node build.mjs --dev",
     "build": "node build.mjs",
-    "preview": "echo 'Preview not implemented'"
+    "preview": "echo 'Preview not implemented'",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^2.1.9",
+    "happy-dom": "^20.14.5",
+    "terser": "^5.31.0",
     "typescript": "^5.6.2",
     "vite": "^5.4.8",
     "vite-plugin-monkey": "^3.5.2",
-    "terser": "^5.31.0"
+    "vitest": "^2.1.9"
   }
 }

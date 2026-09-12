@@ -1,0 +1,40 @@
+{
+  "map": {
+    "title": {
+      "main": "Test Title",
+      "subtitle": "Test Subtitle"
+    },
+    "description": "Test description for unit testing.",
+    "creator": [
+      { "name": "Test Author", "role": "author" },
+      { "name": "Test Narrator", "role": "narrator" }
+    ],
+    "spine": [
+      { "audio-duration": 1000, "media-type": "audio/mpeg", "audio-bitrate": 64, "-odread-original-path": "test-part01.mp3" },
+      { "audio-duration": 2000, "media-type": "audio/mpeg", "audio-bitrate": 64, "-odread-original-path": "test-part02.mp3" },
+      { "audio-duration": 1500, "media-type": "audio/mpeg", "audio-bitrate": 64, "-odread-original-path": "test-part03.mp3" }
+    ],
+    "nav": {
+      "toc": [
+        { "title": "Chapter 1", "path": "test-part01.mp3" },
+        { "title": "Chapter 2", "path": "test-part01.mp3#500" },
+        { "title": "Chapter 3", "path": "test-part02.mp3" },
+        { "title": "Chapter 4", "path": "test-part03.mp3#200" }
+      ]
+    }
+  },
+  "root": {
+    "querySelectorResult": {
+      "href": "https://example.com/cover.jpg"
+    }
+  },
+  "objects": {
+    "spool": {
+      "components": [
+        { "meta": { "path": "test-part01.mp3", "-odread-spine-position": 0, "audio-duration": 1000, "-odread-file-bytes": 8000000, "media-type": "audio/mpeg" }, "spinePosition": 0 },
+        { "meta": { "path": "test-part02.mp3", "-odread-spine-position": 1, "audio-duration": 2000, "-odread-file-bytes": 16000000, "media-type": "audio/mpeg" }, "spinePosition": 1 },
+        { "meta": { "path": "test-part03.mp3", "-odread-spine-position": 2, "audio-duration": 1500, "-odread-file-bytes": 12000000, "media-type": "audio/mpeg" }, "spinePosition": 2 }
+      ]
+    }
+  }
+}
