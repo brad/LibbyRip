@@ -47,10 +47,11 @@ async function buildMain(pageContextCode) {
   const tempMainPath = path.resolve(ROOT, 'src/main.temp.ts');
   fs.writeFileSync(tempMainPath, tempMainContent);
   
+  const date = new Date().toISOString().split('T')[0];
   const meta = `// ==UserScript==
 // @name         LibreGRAB
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      ${date}
 // @author       PsychedelicPalimpsest
 // @description  Download all the booty! - ID3 tagging enabled, no FFmpeg, streaming MP3
 // @license      MIT
