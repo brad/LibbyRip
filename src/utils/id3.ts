@@ -156,7 +156,7 @@ export interface BuildBookId3TagOptions {
   narrator?: string;
   seriesName?: string | null;
   seriesIndex?: number | null;
-  chapters: Array<{ chapter_number: number }>;
+  chapters: Array<{ chapter_number: number; title?: string }>;
   durationByChapter: Record<number, number>;
   coverBytes?: Uint8Array | null;
   coverMime?: string | null;
@@ -181,7 +181,8 @@ chapters.forEach((ch, i) => {
     const end = cursor + dur;
     const cid = i === chapters.length - 1 ? 'last' : ('ch' + (i + 1));
     childIds.push(cid);
-    chapFrames.push(chapFrame(cid, start, end, chapterTitleFor(ch.chapter_number, displayTitle)));
+    const chapterTitle = ch.title || chapterTitleFor(ch.chapter_number, displayTitle);
+    chapFrames.push(chapFrame(cid, start, end, chapterTitle));
     cursor = end;
   });
 
