@@ -128,6 +128,14 @@ export async function buildAudiobookSingleMp3(options: BuildAudiobookOptions): P
   progress('<b>Streaming single MP3...</b>');
 
   const chapterDurations = options.durationByChapter || Object.fromEntries(urls.map((u) => [u.index + 1, u.duration * 1000]));
+  
+  // Map BIF chapters to include chapter_number (1-based) and title
+  // BIF chapters have { title, spine, offset } but not chapter_number
+  const chapters = (metadata.chapters || []).map((ch: any, idx: number) => ({
+    chapter_number: idx + 1,
+    title: ch.title
+  }));
+  
   const buildTagOptions: BuildBookId3TagOptions = {
     book: BIF.map,
     displayTitle,
@@ -135,7 +143,7 @@ export async function buildAudiobookSingleMp3(options: BuildAudiobookOptions): P
     narrator,
     seriesName: (BIF.map.series && BIF.map.series[0]) || null,
     seriesIndex: null,
-    chapters: metadata.chapters || [],
+    chapters,
     durationByChapter: chapterDurations,
     coverBytes,
     coverMime,
