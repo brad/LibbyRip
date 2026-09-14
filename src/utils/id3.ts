@@ -57,7 +57,16 @@ function id3Frame(id: string, payload: Uint8Array): Uint8Array {
   return concatBytes([latin1(id), u32be(payload.length), new Uint8Array([0, 0]), payload]);
 }
 
-export function textFrame(id: string, text: string): Uint8Array {
+export function textFrame(id: string, text: string | { description: string; value: string }): Uint8Array {
+  if (typeof text === 'object') {
+    // TXXX frame with description
+    return id3Frame(id, concatBytes([
+      new Uint8Array([1]), // UTF-16 encoding
+      utf16beBom(text.description),
+      new Uint8Array([0, 0]), // Null terminator for UTF-16
+      utf16beBom(text.value),
+    ]));
+  }
   return id3Frame(id, concatBytes([new Uint8Array([1]), utf16beBom(text)]));
 }
 
@@ -158,8 +167,16 @@ export function buildBookId3Tag(options: BuildBookId3TagOptions): { tag: Uint8Ar
   let cursor = 0;
   const chapFrames: Uint8Array[] = [];
   const childIds: string[] = [];
+  
+  console.log('[LibbyRip] buildBookId3Tag called with:', { 
+    chapters: chapters.length, 
+    durationByChapterKeys: Object.keys(durationByChapter),
+    durationByChapterValues: Object.values(durationByChapter)
+  });
+  
 chapters.forEach((ch, i) => {
     const dur = Number(durationByChapter[String(ch.chapter_number)]) || 0;
+    console.log(`[LibbyRip] Chapter ${ch.chapter_number}: duration = ${dur} ms (from key "${ch.chapter_number}")`);
     const start = cursor;
     const end = cursor + dur;
     const cid = i === chapters.length - 1 ? 'last' : ('ch' + (i + 1));

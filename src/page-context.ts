@@ -1,4 +1,4 @@
-import { buildBookId3Tag, tagChapterMp3, chapterTitleFor } from './utils/id3.js';
+import { buildBookId3Tag, tagChapterMp3, chapterTitleFor, writeId3 } from './utils/id3.js';
 import { parseMpegHeader, countMpegFrames, stripXingFrame, makeXingFrame } from './utils/mpeg.js';
 import { gmFetchBlob, fetchWithRetry, fetchCover, safeFilename } from './utils/fetch.js';
 import { getMetadata, getAuthorString, getNarratorString, createMetadata, type BIF } from './libby/bif.js';
@@ -6,6 +6,7 @@ import { getUrls } from './libby/urls.js';
 import { pickSaveFile, requestSaveFromTopFrame, buildAudiobookSingleMp3, handleIframeDataMessage, requestFromIframe, setupIframeApi, setupIframeFetchHandler } from './utils/download.js';
 import { createAndDownloadMp3, exportChapters } from './libby/chapters.js';
 import { getDownloadZip } from './zip/client-zip.js';
+import { parseId3Tag, formatDuration, type ParsedId3Tag } from './utils/id3-parser.js';
 
 const LIBREGRAB_SAVE_REQUEST = 'LIBREGRAB_SAVE_REQUEST';
 const LIBREGRAB_SAVE_RESULT = 'LIBREGRAB_SAVE_RESULT';
@@ -154,6 +155,8 @@ function buildPirateUi(bif: BIF): void {
 .libregrab-btn:disabled { background: #999; cursor: not-allowed; }
 .libregrab-btn.zip { background: #28a745; }
 .libregrab-btn.zip:hover { background: #1e7e34; }
+.libregrab-btn.debug { background: #ff9500; }
+.libregrab-btn.debug:hover { background: #e68600; }
 .libregrab-panel {
     position: fixed;
     top: 120px;
@@ -184,6 +187,114 @@ function buildPirateUi(bif: BIF): void {
 .libregrab-panel-close:hover { color: #fff; }
 .libregrab-panel-body { flex: 1; overflow-y: auto; padding: 10px; }
 .libregrab-line { margin-bottom: 4px; white-space: pre-wrap; word-break: break-word; }
+.libregrab-debug-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.8);
+    z-index: 2147483648;
+    display: none;
+    align-items: center;
+    justify-content: center;
+}
+.libregrab-debug-modal.active { display: flex; }
+.libregrab-debug-content {
+    background: #fff;
+    color: #333;
+    padding: 24px;
+    border-radius: 8px;
+    width: 90%;
+    max-width: 1000px;
+    max-height: 90%;
+    overflow-y: auto;
+    font-family: system-ui, -apple-system, sans-serif;
+}
+.libregrab-debug-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+    border-bottom: 2px solid #ddd;
+    padding-bottom: 12px;
+}
+.libregrab-debug-header h2 {
+    margin: 0;
+    font-size: 24px;
+}
+.libregrab-debug-close {
+    background: #dc3545;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 16px;
+    cursor: pointer;
+    font-size: 14px;
+}
+.libregrab-debug-close:hover { background: #c82333; }
+.libregrab-debug-section {
+    margin-bottom: 24px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 16px;
+    background: #f8f9fa;
+}
+.libregrab-debug-section h3 {
+    margin: 0 0 12px 0;
+    font-size: 18px;
+    color: #0066cc;
+}
+.libregrab-debug-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    background: white;
+}
+.libregrab-debug-table th,
+.libregrab-debug-table td {
+    border: 1px solid #ddd;
+    padding: 8px 12px;
+    text-align: left;
+}
+.libregrab-debug-table th {
+    background: #e9ecef;
+    font-weight: 600;
+}
+.libregrab-debug-table tr:nth-child(even) {
+    background: #f8f9fa;
+}
+.libregrab-debug-diff {
+    color: #dc3545;
+    font-weight: 600;
+}
+.libregrab-debug-match {
+    color: #28a745;
+}
+.libregrab-debug-missing {
+    color: #ffc107;
+    font-style: italic;
+}
+.libregrab-debug-actions {
+    margin-top: 20px;
+    display: flex;
+    gap: 12px;
+}
+.libregrab-debug-btn {
+    background: #28a745;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 12px 24px;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: 600;
+}
+.libregrab-debug-btn:hover { background: #1e7e34; }
+.libregrab-debug-btn:disabled {
+    background: #6c757d;
+    cursor: not-allowed;
+}
 .foldMenu{
     position: absolute;
     width: 100%;
@@ -225,12 +336,14 @@ function buildPirateUi(bif: BIF): void {
     <button class="libregrab-btn" id="libregrab-btn-mp3">Export as MP3</button>
     <button class="libregrab-btn zip" id="libregrab-btn-zip">Export as ZIP</button>
     <button class="libregrab-btn" id="libregrab-btn-chapters">View Chapters</button>
+    <button class="libregrab-btn debug" id="libregrab-btn-debug">Mp3 Debug</button>
   `;
   document.body.appendChild(ui);
 
   ui.querySelector('#libregrab-btn-mp3')!.onclick = exportMP3;
   ui.querySelector('#libregrab-btn-zip')!.onclick = exportChaptersHandler;
   ui.querySelector('#libregrab-btn-chapters')!.onclick = viewChapters;
+  ui.querySelector('#libregrab-btn-debug')!.onclick = openMp3Debug;
 
   // Progress panel
   const panel = document.createElement('div');
@@ -256,6 +369,449 @@ function buildPirateUi(bif: BIF): void {
   chapterMenuElem.setAttribute('tabindex', '-1');
   chapterMenuElem.innerHTML = chaptersMenu;
   document.body.appendChild(chapterMenuElem);
+
+  // Debug modal
+  const debugModal = document.createElement('div');
+  debugModal.className = 'libregrab-debug-modal';
+  debugModal.id = 'libregrab-debug-modal';
+  debugModal.innerHTML = `
+    <div class="libregrab-debug-content">
+      <div class="libregrab-debug-header">
+        <h2>MP3 Debug - ID3 vs BIF Comparison</h2>
+        <button class="libregrab-debug-close" id="libregrab-debug-close-btn">Close</button>
+      </div>
+      <div id="libregrab-debug-body"></div>
+    </div>
+  `;
+  document.body.appendChild(debugModal);
+
+  debugModal.querySelector('#libregrab-debug-close-btn')!.onclick = () => {
+    debugModal.classList.remove('active');
+  };
+
+  // Click outside to close
+  debugModal.onclick = (e) => {
+    if (e.target === debugModal) {
+      debugModal.classList.remove('active');
+    }
+  };
+}
+
+let currentMp3File: File | null = null;
+let currentMp3Data: Uint8Array | null = null;
+let currentId3Data: ParsedId3Tag | null = null;
+
+async function openMp3Debug(): Promise<void> {
+  console.log('[LibbyRip] Opening MP3 Debug');
+  
+  // Create file input
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.mp3,audio/mpeg';
+  
+  input.onchange = async () => {
+    if (!input.files || input.files.length === 0) return;
+    
+    const file = input.files[0];
+    console.log('[LibbyRip] Selected file:', file.name, file.size);
+    
+    try {
+      // Only read first 1MB for ID3 parsing (tags are typically < 500KB)
+      const maxId3Size = 1024 * 1024; // 1MB
+      const readSize = Math.min(file.size, maxId3Size);
+      const headerBlob = file.slice(0, readSize);
+      const headerBuffer = await headerBlob.arrayBuffer();
+      
+      // Store reference to full file for later if needed
+      currentMp3File = file;
+      currentMp3Data = null; // Don't load full file into memory yet
+      
+      // Parse ID3 tags from header only
+      currentId3Data = parseId3Tag(headerBuffer);
+      
+      if (!currentId3Data) {
+        alert('Could not parse ID3 tags from this MP3 file.');
+        return;
+      }
+      
+      console.log('[LibbyRip] Parsed ID3:', currentId3Data);
+      
+      // Get BIF metadata from iframe
+      const iframe = document.querySelector('iframe[src*="listen.libbyapp.com"]') as HTMLIFrameElement | null;
+      if (!iframe) {
+        alert('Audiobook player iframe not found. Please open the audiobook player first.');
+        return;
+      }
+      
+      const { metadata } = await requestFromIframe<{ metadata: any }>('LIBREGRAB_GET_URLS');
+      const { author, narrator } = await requestFromIframe<{ author: string; narrator: string }>('LIBREGRAB_GET_CREATORS');
+      
+      console.log('[LibbyRip] BIF metadata:', metadata);
+      
+      // Show comparison
+      showDebugComparison(currentId3Data, metadata, author, narrator);
+      
+    } catch (e) {
+      console.error('[LibbyRip] MP3 Debug error:', e);
+      alert('Error reading MP3 file: ' + (e as Error).message);
+    }
+  };
+  
+  input.click();
+}
+
+function showDebugComparison(id3: ParsedId3Tag, bifMetadata: any, author: string, narrator: string): void {
+  const modal = document.getElementById('libregrab-debug-modal');
+  const body = document.getElementById('libregrab-debug-body');
+  
+  if (!modal || !body) return;
+  
+  let html = '';
+  
+  // Basic metadata comparison
+  html += '<div class="libregrab-debug-section">';
+  html += '<h3>Basic Metadata</h3>';
+  html += '<table class="libregrab-debug-table">';
+  html += '<tr><th>Field</th><th>ID3 Value</th><th>BIF Value</th><th>Status</th></tr>';
+  
+  const metadataFields = [
+    { name: 'Title', id3: id3.metadata.title, bif: bifMetadata.title },
+    { name: 'Artist', id3: id3.metadata.artist, bif: author },
+    { name: 'Album', id3: id3.metadata.album, bif: bifMetadata.title },
+    { name: 'Album Artist', id3: id3.metadata.albumArtist, bif: narrator },
+    { name: 'Composer', id3: id3.metadata.composer, bif: narrator },
+    { name: 'Genre', id3: id3.metadata.genre, bif: 'Audiobook' },
+  ];
+  
+  for (const field of metadataFields) {
+    const match = field.id3 === field.bif;
+    const status = match ? '<span class="libregrab-debug-match">✓ Match</span>' : '<span class="libregrab-debug-diff">✗ Different</span>';
+    html += `<tr>
+      <td><strong>${field.name}</strong></td>
+      <td>${field.id3 || '<span class="libregrab-debug-missing">Not set</span>'}</td>
+      <td>${field.bif || '<span class="libregrab-debug-missing">Not available</span>'}</td>
+      <td>${status}</td>
+    </tr>`;
+  }
+  
+  html += '</table>';
+  html += '</div>';
+  
+  // Chapter comparison
+  html += '<div class="libregrab-debug-section">';
+  html += '<h3>Chapter Markers (CHAP frames)</h3>';
+  
+  const id3ChapterCount = id3.chapters.length;
+  const bifChapterCount = bifMetadata.chapters ? bifMetadata.chapters.length : 0;
+  
+  html += `<p><strong>ID3 Chapters:</strong> ${id3ChapterCount}</p>`;
+  html += `<p><strong>BIF Chapters:</strong> ${bifChapterCount}</p>`;
+  
+  if (id3ChapterCount > 0) {
+    html += '<h4>ID3 Chapter Details:</h4>';
+    html += '<table class="libregrab-debug-table">';
+    html += '<tr><th>#</th><th>ID</th><th>Start Time</th><th>End Time</th><th>Duration</th><th>Title</th></tr>';
+    
+    id3.chapters.forEach((chap, i) => {
+      const duration = chap.endMs - chap.startMs;
+      html += `<tr>
+        <td>${i + 1}</td>
+        <td><code>${chap.id}</code></td>
+        <td>${formatDuration(chap.startMs)}</td>
+        <td>${formatDuration(chap.endMs)}</td>
+        <td>${formatDuration(duration)}</td>
+        <td>${chap.title}</td>
+      </tr>`;
+    });
+    
+    html += '</table>';
+  } else {
+    html += '<p class="libregrab-debug-missing">⚠ No CHAP frames found in ID3 tags</p>';
+  }
+  
+  if (bifChapterCount > 0 && bifMetadata.chapters) {
+    html += '<h4>BIF Chapter Details:</h4>';
+    html += '<table class="libregrab-debug-table">';
+    html += '<tr><th>#</th><th>Title</th><th>Spine</th><th>Offset (s)</th></tr>';
+    
+    bifMetadata.chapters.forEach((chap: any, i: number) => {
+      html += `<tr>
+        <td>${i + 1}</td>
+        <td>${chap.title}</td>
+        <td>${chap.spine}</td>
+        <td>${chap.offset}</td>
+      </tr>`;
+    });
+    
+    html += '</table>';
+  }
+  
+  html += '</div>';
+  
+  // Table of Contents (CTOC)
+  if (id3.toc) {
+    html += '<div class="libregrab-debug-section">';
+    html += '<h3>Table of Contents (CTOC frame)</h3>';
+    html += `<p><strong>TOC ID:</strong> <code>${id3.toc.id}</code></p>`;
+    html += `<p><strong>Description:</strong> ${id3.toc.description}</p>`;
+    html += `<p><strong>Child IDs:</strong> ${id3.toc.childIds.join(', ')}</p>`;
+    html += '</div>';
+  } else {
+    html += '<div class="libregrab-debug-section">';
+    html += '<h3>Table of Contents (CTOC frame)</h3>';
+    html += '<p class="libregrab-debug-missing">⚠ No CTOC frame found in ID3 tags</p>';
+    html += '</div>';
+  }
+  
+  // Duration comparison
+  html += '<div class="libregrab-debug-section">';
+  html += '<h3>Duration</h3>';
+  html += '<table class="libregrab-debug-table">';
+  html += '<tr><th>Source</th><th>Duration</th></tr>';
+  
+  if (id3.metadata.duration) {
+    html += `<tr><td>ID3 TLEN frame</td><td>${formatDuration(id3.metadata.duration)}</td></tr>`;
+  } else {
+    html += `<tr><td>ID3 TLEN frame</td><td><span class="libregrab-debug-missing">Not set</span></td></tr>`;
+  }
+  
+  if (id3ChapterCount > 0 && id3.chapters.length > 0) {
+    const lastChapter = id3.chapters[id3.chapters.length - 1];
+    html += `<tr><td>ID3 Chapters (last end time)</td><td>${formatDuration(lastChapter.endMs)}</td></tr>`;
+  }
+  
+  if (bifMetadata.spine && Array.isArray(bifMetadata.spine)) {
+    const totalBifDuration = bifMetadata.spine.reduce((sum: number, s: any) => sum + (s.duration || 0), 0);
+    html += `<tr><td>BIF Total (spine)</td><td>${formatDuration(totalBifDuration * 1000)}</td></tr>`;
+  }
+  
+  html += '</table>';
+  html += '</div>';
+  
+  // Action buttons
+  html += '<div class="libregrab-debug-actions">';
+  
+  const hasChapterMismatch = (bifChapterCount > 0 && id3ChapterCount === 0) || 
+                             (bifChapterCount > 0 && id3ChapterCount !== bifChapterCount);
+  
+  if (hasChapterMismatch) {
+    html += '<button class="libregrab-debug-btn" id="libregrab-copy-chapters-btn">Copy BIF Chapters to MP3</button>';
+  }
+  
+  const hasMetadataMismatch = metadataFields.some(f => f.id3 !== f.bif);
+  
+  if (hasMetadataMismatch || hasChapterMismatch) {
+    html += '<button class="libregrab-debug-btn" id="libregrab-fix-all-btn">Fix All Metadata</button>';
+  }
+  
+  html += '</div>';
+  
+  body.innerHTML = html;
+  
+  // Attach event listeners
+  const copyChaptersBtn = document.getElementById('libregrab-copy-chapters-btn');
+  if (copyChaptersBtn) {
+    copyChaptersBtn.onclick = () => copyBifChaptersToMp3(bifMetadata, author, narrator);
+  }
+  
+  const fixAllBtn = document.getElementById('libregrab-fix-all-btn');
+  if (fixAllBtn) {
+    fixAllBtn.onclick = () => fixAllMetadata(bifMetadata, author, narrator);
+  }
+  
+  modal.classList.add('active');
+}
+
+async function copyBifChaptersToMp3(bifMetadata: any, author: string, narrator: string): Promise<void> {
+  if (!currentMp3File) {
+    alert('No MP3 file loaded');
+    return;
+  }
+  
+  try {
+    // Now load the full file only when user clicks the fix button
+    if (!currentMp3Data) {
+      console.log('[LibbyRip] Loading full MP3 file for retagging...');
+      const arrayBuffer = await currentMp3File.arrayBuffer();
+      currentMp3Data = new Uint8Array(arrayBuffer);
+    }
+    
+    // Get BIF metadata for chapters
+    const { urls } = await requestFromIframe<{ urls: any[] }>('LIBREGRAB_GET_URLS');
+    
+    console.log('[LibbyRip] Got URLs from iframe:', urls);
+    console.log('[LibbyRip] BIF metadata:', bifMetadata);
+    
+    // Build duration by chapter from spine durations in metadata
+    // bifMetadata.spine has the actual duration data
+    const spineDurations: number[] = bifMetadata.spine.map((s: any) => s.duration * 1000);
+    console.log('[LibbyRip] Spine durations (ms):', spineDurations);
+    
+    // Calculate cumulative time for each spine position
+    const cumulativeSpineTimes: number[] = [0];
+    for (let i = 0; i < spineDurations.length; i++) {
+      cumulativeSpineTimes.push(cumulativeSpineTimes[i] + spineDurations[i]);
+    }
+    
+    console.log('[LibbyRip] Cumulative spine times:', cumulativeSpineTimes);
+    
+    // If BIF has actual chapters with spine/offset, use those
+    // Otherwise fall back to treating each spine as a chapter
+    let chapters: Array<{ chapter_number: number; title?: string }>;
+    let durationByChapter: Record<number, number>;
+    
+    if (bifMetadata.chapters && bifMetadata.chapters.length > 0) {
+      console.log('[LibbyRip] Using BIF chapters:', bifMetadata.chapters);
+      
+      // BIF chapters have spine index and offset in seconds
+      // Calculate duration for each chapter
+      durationByChapter = {};
+      chapters = bifMetadata.chapters.map((ch: any, idx: number) => {
+        const chNum = idx + 1;
+        const startSpine = ch.spine;
+        const startOffset = ch.offset * 1000; // Convert to ms
+        const startTime = cumulativeSpineTimes[startSpine] + startOffset;
+        
+        console.log(`[LibbyRip] Chapter ${chNum} "${ch.title}": spine ${startSpine}, offset ${ch.offset}s, startTime ${startTime}ms`);
+        
+        // Find end time (start of next chapter or end of book)
+        let endTime: number;
+        if (idx < bifMetadata.chapters.length - 1) {
+          const nextCh = bifMetadata.chapters[idx + 1];
+          const nextStartSpine = nextCh.spine;
+          const nextStartOffset = nextCh.offset * 1000;
+          endTime = cumulativeSpineTimes[nextStartSpine] + nextStartOffset;
+        } else {
+          // Last chapter goes to end of book
+          endTime = cumulativeSpineTimes[cumulativeSpineTimes.length - 1];
+        }
+        
+        const duration = endTime - startTime;
+        console.log(`[LibbyRip] Chapter ${chNum}: endTime ${endTime}ms, duration ${duration}ms`);
+        
+        durationByChapter[chNum] = duration;
+        
+        return {
+          chapter_number: chNum,
+          title: ch.title
+        };
+      });
+    } else {
+      console.log('[LibbyRip] No BIF chapters found, using spine positions as chapters');
+      
+      // Fall back to treating each spine position as a chapter
+      durationByChapter = {};
+      spineDurations.forEach((dur, index) => {
+        const chNum = index + 1;
+        durationByChapter[chNum] = dur;
+      });
+      
+      chapters = spineDurations.map((_, index) => ({
+        chapter_number: index + 1,
+      }));
+    }
+    
+    console.log('[LibbyRip] Final durationByChapter:', durationByChapter);
+    console.log('[LibbyRip] Final chapters array:', chapters);
+    
+    // Get cover
+    let coverBytes: Uint8Array | null = null;
+    let coverMime: string | null = null;
+    
+    if (bifMetadata.coverUrl) {
+      try {
+        const coverResult = await fetchCover(
+          bifMetadata.coverUrl,
+          (msg) => console.log('[LibbyRip]', msg)
+        );
+        coverBytes = coverResult.bytes;
+        coverMime = coverResult.mime;
+      } catch (e) {
+        console.warn('[LibbyRip] Could not fetch cover:', e);
+      }
+    }
+    
+    // Build new ID3 tag with all frames
+    const { tag } = buildBookId3Tag({
+      book: bifMetadata,
+      displayTitle: bifMetadata.title,
+      author,
+      narrator,
+      seriesName: null,
+      seriesIndex: null,
+      chapters,
+      durationByChapter,
+      coverBytes,
+      coverMime,
+    });
+    
+    // The tag returned by buildBookId3Tag is already a complete ID3v2 tag
+    // We need to strip the old ID3 and prepend the new one
+    const mp3WithoutId3 = stripId3(currentMp3Data);
+    const newMp3 = concatBytes([tag, mp3WithoutId3]);
+    
+    // Download the new file
+    const blob = new Blob([newMp3], { type: 'audio/mpeg' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = currentMp3File.name.replace(/\.mp3$/i, '_fixed.mp3');
+    link.click();
+    URL.revokeObjectURL(url);
+    
+    alert('New MP3 with BIF chapters saved!');
+    
+    // Clear the loaded data to free memory
+    currentMp3Data = null;
+    
+  } catch (e) {
+    console.error('[LibbyRip] Copy chapters error:', e);
+    alert('Error copying chapters: ' + (e as Error).message);
+  }
+}
+
+function concatBytes(parts: Array<Uint8Array | ArrayBuffer | number[]>): Uint8Array {
+  const arrays = parts.map((p) => {
+    if (p instanceof Uint8Array) return p;
+    if (p instanceof ArrayBuffer) return new Uint8Array(p);
+    return new Uint8Array(p);
+  });
+  let total = 0;
+  for (const a of arrays) total += a.length;
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const a of arrays) {
+    out.set(a, o);
+    o += a.length;
+  }
+  return out;
+}
+
+function stripId3(buf: Uint8Array | ArrayBuffer): Uint8Array {
+  let u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  if (u8.length >= 10 && u8[0] === 0x49 && u8[1] === 0x44 && u8[2] === 0x33) {
+    const size = ((u8[6] & 0x7f) << 21) | ((u8[7] & 0x7f) << 14) | ((u8[8] & 0x7f) << 7) | (u8[9] & 0x7f);
+    const footer = (u8[5] & 0x10) ? 10 : 0;
+    const start = 10 + size + footer;
+    if (start > 0 && start < u8.length) u8 = u8.subarray(start);
+  }
+  if (u8.length >= 128 &&
+    u8[u8.length - 128] === 0x54 &&
+    u8[u8.length - 127] === 0x41 &&
+    u8[u8.length - 126] === 0x47) {
+    u8 = u8.subarray(0, u8.length - 128);
+  }
+  for (let i = 0; i < u8.length - 1; i++) {
+    if (u8[i] === 0xff && (u8[i + 1] & 0xe0) === 0xe0) {
+      return i === 0 ? u8 : u8.subarray(i);
+    }
+  }
+  return u8;
+}
+
+async function fixAllMetadata(bifMetadata: any, author: string, narrator: string): Promise<void> {
+  // This just calls copyBifChaptersToMp3 since it rebuilds all metadata
+  await copyBifChaptersToMp3(bifMetadata, author, narrator);
 }
 
 async function exportMP3(): Promise<void> {
