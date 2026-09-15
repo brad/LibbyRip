@@ -250,6 +250,7 @@ function buildPirateUi(bif: BIF): void {
     border-collapse: collapse;
     margin: 12px 0;
     background: white;
+    table-layout: fixed;
 }
 .libregrab-debug-table th,
 .libregrab-debug-table td {
@@ -261,6 +262,10 @@ function buildPirateUi(bif: BIF): void {
     background: #e9ecef;
     font-weight: 600;
 }
+.libregrab-debug-table th:nth-child(1),
+.libregrab-debug-table td:nth-child(1) { width: 180px; }
+.libregrab-debug-table th:nth-child(4),
+.libregrab-debug-table td:nth-child(4) { width: 140px; white-space: nowrap; }
 .libregrab-debug-table tr:nth-child(even) {
     background: #f8f9fa;
 }
