@@ -28,9 +28,38 @@ describe('libby/bif.ts', () => {
       expect(meta.title).toBe('Test Title');
     });
 
-    it('extracts description from map', () => {
+    it('extracts description from map (string)', () => {
       const meta = getMetadata(bif);
       expect(meta.description).toBe('Test description for unit testing.');
+    });
+
+    it('extracts description from map (object with short/full)', () => {
+      const bifWithObjectDesc = {
+        ...bif,
+        map: {
+          ...bif.map,
+          description: {
+            short: 'Short description.',
+            full: 'Full description with details.',
+          },
+        },
+      } as unknown as BIF;
+      const meta = getMetadata(bifWithObjectDesc);
+      expect(meta.description).toBe('Short description.');
+    });
+
+    it('extracts description from map (object with full only)', () => {
+      const bifWithFullOnly = {
+        ...bif,
+        map: {
+          ...bif.map,
+          description: {
+            full: 'Only full description available.',
+          },
+        },
+      } as unknown as BIF;
+      const meta = getMetadata(bifWithFullOnly);
+      expect(meta.description).toBe('Only full description available.');
     });
 
     it('extracts author from creators', () => {

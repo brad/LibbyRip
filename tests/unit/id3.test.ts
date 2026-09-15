@@ -162,6 +162,129 @@ describe('utils/id3.ts', () => {
       expect(tagBytes).not.toContain('TPE2');
       expect(tagBytes).not.toContain('APIC');
     });
+
+    it('uses chapter titles from chapters array when provided', () => {
+      const options = {
+        book: { description: 'Test description' },
+        displayTitle: 'Test Book',
+        author: 'Test Author',
+        chapters: [
+          { chapter_number: 1, title: 'Prologue' },
+          { chapter_number: 2, title: 'Chapter One' },
+          { chapter_number: 3 }, // no title, should fall back
+        ],
+        durationByChapter: { 1: 1000, 2: 2000, 3: 3000 },
+        coverBytes: null,
+        coverMime: null,
+      };
+
+      const { tag } = buildBookId3Tag(options);
+      // Search raw bytes for UTF-16BE encoded strings
+      const prologueBytes = new TextEncoder().encode('Prologue');
+      const chapterOneBytes = new TextEncoder().encode('Chapter One');
+      const chapterThreeBytes = new TextEncoder().encode('Chapter 3');
+      
+      // Convert to UTF-16BE for searching
+      function toUtf16be(str: string): Uint8Array {
+        const result = new Uint8Array(str.length * 2);
+        for (let i = 0; i < str.length; i++) {
+          const char = str.charCodeAt(i);
+          result[i * 2] = (char >> 8) & 0xFF;
+          result[i * 2 + 1] = char & 0xFF;
+        }
+        return result;
+      }
+      
+      function containsBytes(haystack: Uint8Array, needle: Uint8Array): boolean {
+        for (let i = 0; i <= haystack.length - needle.length; i++) {
+          let found = true;
+          for (let j = 0; j < needle.length; j++) {
+            if (haystack[i + j] !== needle[j]) {
+              found = false;
+              break;
+            }
+          }
+          if (found) return true;
+        }
+        return false;
+      }
+      
+      expect(containsBytes(tag, toUtf16be('Prologue'))).toBe(true);
+      expect(containsBytes(tag, toUtf16be('Chapter One'))).toBe(true);
+      expect(containsBytes(tag, toUtf16be('Chapter 3'))).toBe(true);
+    });
+
+    it('uses book description in COMM frame when available', () => {
+      const options = {
+        book: { description: 'Book description here' },
+        displayTitle: 'Test Book',
+        author: 'Test Author',
+        chapters: [{ chapter_number: 1 }],
+        durationByChapter: { 1: 1800000 },
+        coverBytes: null,
+        coverMime: null,
+      };
+
+      const { tag } = buildBookId3Tag(options);
+      // Search raw bytes for UTF-16BE encoded strings
+      function toUtf16be(str: string): Uint8Array {
+        const result = new Uint8Array(str.length * 2);
+        for (let i = 0; i < str.length; i++) {
+          const char = str.charCodeAt(i);
+          result[i * 2] = (char >> 8) & 0xFF;
+          result[i * 2 + 1] = char & 0xFF;
+        }
+        return result;
+      }
+      function containsBytes(haystack: Uint8Array, needle: Uint8Array): boolean {
+        for (let i = 0; i <= haystack.length - needle.length; i++) {
+          let found = true;
+          for (let j = 0; j < needle.length; j++) {
+            if (haystack[i + j] !== needle[j]) { found = false; break; }
+          }
+          if (found) return true;
+        }
+        return false;
+      }
+      
+      expect(containsBytes(tag, toUtf16be('Book description here'))).toBe(true);
+      expect(containsBytes(tag, toUtf16be('Audiobook exported by LibreGRAB'))).toBe(false);
+    });
+
+    it('uses fallback COMM frame when no book description', () => {
+      const options = {
+        book: {},
+        displayTitle: 'Test Book',
+        author: 'Test Author',
+        chapters: [{ chapter_number: 1 }],
+        durationByChapter: { 1: 1800000 },
+        coverBytes: null,
+        coverMime: null,
+      };
+
+      const { tag } = buildBookId3Tag(options);
+      function toUtf16be(str: string): Uint8Array {
+        const result = new Uint8Array(str.length * 2);
+        for (let i = 0; i < str.length; i++) {
+          const char = str.charCodeAt(i);
+          result[i * 2] = (char >> 8) & 0xFF;
+          result[i * 2 + 1] = char & 0xFF;
+        }
+        return result;
+      }
+      function containsBytes(haystack: Uint8Array, needle: Uint8Array): boolean {
+        for (let i = 0; i <= haystack.length - needle.length; i++) {
+          let found = true;
+          for (let j = 0; j < needle.length; j++) {
+            if (haystack[i + j] !== needle[j]) { found = false; break; }
+          }
+          if (found) return true;
+        }
+        return false;
+      }
+      
+      expect(containsBytes(tag, toUtf16be('Audiobook exported by LibreGRAB from Libby.'))).toBe(true);
+    });
   });
 
   describe('tagChapterMp3', () => {
