@@ -136,8 +136,11 @@ export async function buildAudiobookSingleMp3(options: BuildAudiobookOptions): P
     title: ch.title
   }));
   
+  const bifDesc = BIF.map.description;
+  const description = typeof bifDesc === 'string' ? bifDesc : (bifDesc?.short || bifDesc?.full || '');
+  
   const buildTagOptions: BuildBookId3TagOptions = {
-    book: BIF.map,
+    book: { ...BIF.map, description },
     displayTitle,
     author,
     narrator,

@@ -265,15 +265,28 @@ export function parseId3Tag(buffer: ArrayBuffer): ParsedId3Tag | null {
       // Comment frame has encoding, language, short description, then text
       if (frameData.length > 4) {
         const encoding = frameData[0];
-        // Skip language (3 bytes) and short description (null terminated)
+        // Skip language (3 bytes)
         let commentOffset = 4;
-        while (commentOffset < frameData.length && frameData[commentOffset] !== 0) commentOffset++;
-        commentOffset++;
+        // Skip short description (null terminated - handles both ISO-8859-1 and UTF-16)
+        if (encoding === 1 || encoding === 2) {
+          // UTF-16: null terminator is 2 bytes (00 00)
+          while (commentOffset + 1 < frameData.length && !(frameData[commentOffset] === 0 && frameData[commentOffset + 1] === 0)) {
+            commentOffset += 2;
+          }
+          commentOffset += 2; // Skip 2-byte null terminator
+        } else {
+          // ISO-8859-1 / UTF-8: null terminator is 1 byte
+          while (commentOffset < frameData.length && frameData[commentOffset] !== 0) commentOffset++;
+          commentOffset++; // Skip 1-byte null terminator
+        }
         if (commentOffset < frameData.length) {
           if (encoding === 0) {
             metadata.comment = readLatin1(frameData, commentOffset, frameData.length - commentOffset);
-          } else if (encoding === 1) {
+          } else if (encoding === 1 || encoding === 2) {
             metadata.comment = readUtf16(frameData, commentOffset, frameData.length - commentOffset);
+          } else if (encoding === 3) {
+            const decoder = new TextDecoder('utf-8');
+            metadata.comment = decoder.decode(frameData.subarray(commentOffset));
           }
         }
       }

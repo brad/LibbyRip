@@ -481,6 +481,7 @@ function showDebugComparison(id3: ParsedId3Tag, bifMetadata: any, author: string
     { name: 'Album Artist', id3: id3.metadata.albumArtist, bif: narrator },
     { name: 'Composer', id3: id3.metadata.composer, bif: narrator },
     { name: 'Genre', id3: id3.metadata.genre, bif: 'Audiobook' },
+    { name: 'Description', id3: id3.metadata.comment, bif: typeof bifMetadata.description === 'string' ? bifMetadata.description : (bifMetadata.description?.short || bifMetadata.description?.full || '') },
   ];
   
   for (const field of metadataFields) {

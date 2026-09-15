@@ -205,8 +205,11 @@ chapters.forEach((ch, i) => {
     if (yearMatch) frames.push(textFrame('TYER', yearMatch[1]));
   }
   if (cursor) frames.push(textFrame('TLEN', String(Math.round(cursor))));
-  if (book.description) frames.push(commFrame(book.description));
-  frames.push(commFrame('Audiobook exported by LibreGRAB from Libby.', 'eng'));
+  if (book.description) {
+    frames.push(commFrame(book.description));
+  } else {
+    frames.push(commFrame('Audiobook exported by LibreGRAB from Libby.', 'eng'));
+  }
   if (coverBytes && coverBytes.length) frames.push(apicFrame(coverBytes, coverMime!));
   if (childIds.length) {
     frames.push(ctocFrame('toc', childIds, 'Table of Contents'));
@@ -253,8 +256,11 @@ export function tagChapterMp3(arrayBuffer: ArrayBuffer, options: TagChapterMp3Op
     }
     if (durationMs) frames.push(textFrame('TLEN', String(Math.round(durationMs))));
     if (coverBytes && coverBytes.length) frames.push(apicFrame(coverBytes, coverMime!));
-    if (book.description) frames.push(commFrame(book.description));
-    frames.push(commFrame('Audiobook exported by LibreGRAB from Libby.', 'eng'));
+    if (book.description) {
+      frames.push(commFrame(book.description));
+    } else {
+      frames.push(commFrame('Audiobook exported by LibreGRAB from Libby.', 'eng'));
+    }
     return new Blob([writeId3(arrayBuffer, frames)], { type: 'audio/mpeg' });
   } catch (e) {
     if (progress) progress(`  NOTE: ID3 tagging failed for chapter ${chapterNumber} (file kept untagged): ${(e as Error).message}`);

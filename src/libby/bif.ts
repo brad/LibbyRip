@@ -62,9 +62,12 @@ export function getMetadata(BIF: BIF): BookMetadata {
   const spineToIndex = BIF.map.spine.map((x) => x['-odread-original-path']);
   const coverEl = BIF.root.querySelector('image');
   const coverUrl = coverEl ? coverEl.getAttribute('href') : null;
+  const bifDesc = BIF.map.description;
+  // BIF description is an object with 'full' and 'short' properties; use 'short' if available
+  const description = typeof bifDesc === 'string' ? bifDesc : (bifDesc?.short || bifDesc?.full || '');
   const metadata: BookMetadata = {
     title: BIF.map.title.main,
-    description: BIF.map.description,
+    description,
     coverUrl,
     creator: BIF.map.creator,
     spine: BIF.map.spine.map((x) => ({
