@@ -726,6 +726,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         // client-side (see decryptChapterShell): the served HTML is only a
         // shell holding an encrypted payload.
         let fetched = 0;
+        const statusCounts = {};
         for (let c of components){
             const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
             if (!src){
@@ -746,6 +747,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 continue;
             }
             const chapter = decryptChapterShell(await res.text());
+            statusCounts[chapter.status] = (statusCounts[chapter.status] || 0) + 1;
             if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
                 const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
                     ") - page will be empty";
@@ -761,6 +763,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             const acc = downloadElem.querySelector("span#chapAcc");
             if (acc) acc.innerHTML = ` ${fetched}/${totComp}`;
         }
+        console.log("LibreGRAB: chapter decrypt summary: " + JSON.stringify(statusCounts));
 
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
@@ -1252,6 +1255,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         document.head.appendChild(s)
 
         buildBookPirateUi();
+        console.log("LibreGRAB: ebook UI ready (PR #4 instrumented build)");
     }
 
     function downloadEPUBBBtn(){
