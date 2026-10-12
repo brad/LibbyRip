@@ -611,26 +611,35 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     // with every 4-char group's 1st and 4th characters swapped; decoding it
     // yields the real <body>...</body> HTML. This replicates Libby's own
     // __bif_cfc1 decryptor so the download doesn't depend on their globals.
+    //
+    // Returns {html, status}. Status is one of:
+    //   "decrypted"     - payload found and decrypted into a real <body>
+    //   "unencrypted"   - no payload and no <script> in the body (cover, title, ...)
+    //   "unknown-shell" - no payload match, but the body holds a <script>:
+    //                     the shell format changed and we cannot decrypt it
+    //   "decrypt-failed"- payload found but the transform threw
+    //   "bad-payload"   - payload decrypted to something that is not a <body>
     function decryptChapterShell(shellHtml){
         const m = shellHtml.match(/parent\.__bif_cfc1\(self,'([^']+)'\)/)
                || shellHtml.match(/parent\.__bif_cfc0\(self,'([^']+)'\)/);
-        if (!m) return shellHtml; // unencrypted chapter (cover, title page, ...)
+        if (!m){
+            const hasScript = /<body[^>]*>[\s\S]*<script/i.test(shellHtml);
+            return {html: shellHtml, status: hasScript ? "unknown-shell" : "unencrypted"};
+        }
         const isCfc1 = shellHtml.includes("__bif_cfc1");
         let decrypted;
         try{
             const raw = m[1];
             decrypted = atob(isCfc1 ? raw.replace(/(.)(.)(.)(.)/g, "$4$2$3$1") : raw);
         }catch(e){
-            console.warn("chapter decrypt failed, using shell as-is", e);
-            return shellHtml;
+            return {html: shellHtml, status: "decrypt-failed"};
         }
         if (!/^\s*<body/i.test(decrypted)){
-            console.warn("chapter decrypt produced unexpected payload, using shell as-is");
-            return shellHtml;
+            return {html: shellHtml, status: "bad-payload"};
         }
         // Splice the decrypted <body> into the shell, keeping its <head> (styles).
         const spliced = shellHtml.replace(/<body[^>]*>[\s\S]*<\/body>/i, ()=>decrypted);
-        return spliced !== shellHtml ? spliced : shellHtml;
+        return {html: spliced !== shellHtml ? spliced : shellHtml, status: "decrypted"};
     }
 
     async function waitForChapters(callback){
@@ -736,10 +745,17 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 downloadElem.scrollTo(0, downloadElem.scrollHeight);
                 continue;
             }
-            const html = decryptChapterShell(await res.text());
+            const chapter = decryptChapterShell(await res.text());
+            if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
+                const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
+                    ") - page will be empty";
+                console.warn(msg);
+                downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            }
             files.push({
                 name: "OEBPS/" + truncate(c.id),
-                input: fixXhtml(idToMetaId[c.id] || c.id, src, html, imgAssests, cssRegistry[c.id] || [])
+                input: fixXhtml(idToMetaId[c.id] || c.id, src, chapter.html, imgAssests, cssRegistry[c.id] || [])
             });
             fetched += 1;
             const acc = downloadElem.querySelector("span#chapAcc");
@@ -749,25 +765,56 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
+        // Download assets with bounded concurrency and retries. Firing off
+        // hundreds of requests at once can get throttled (HTTP 429) by the
+        // CDN, and a single failed fetch used to mean a broken image/asset
+        // with no second chance.
+        const ASSET_CONCURRENCY = 6;
+        const ASSET_MAX_ATTEMPTS = 3;
+        async function fetchAssetWithRetry(url) {
+            let lastError = "unknown error";
+            for (let attempt = 1; attempt <= ASSET_MAX_ATTEMPTS; attempt++) {
+                try {
+                    const response = await fetch(url);
+                    if (response.status === 200) return response;
+                    lastError = "HTTP " + response.status;
+                    // Retry throttling and server errors; other 4xx won't recover.
+                    if (response.status !== 429 && response.status < 500) break;
+                } catch (e) {
+                    lastError = (e && e.message) ? e.message : String(e);
+                }
+                if (attempt < ASSET_MAX_ATTEMPTS) {
+                    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+                }
+            }
+            throw new Error(lastError);
+        }
 
         gc = 0;
-        await Promise.all(imgAssests.map(name=>(async function(){
-            const response = await fetch(name.startsWith("http") ? name : location.origin + "/" + name);
-            if (response.status != 200) {
-                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name}<br>`
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                return;
+        const assetQueue = imgAssests.slice();
+        async function assetWorker() {
+            while (assetQueue.length) {
+                const name = assetQueue.shift();
+                const url = name.startsWith("http") ? name : location.origin + "/" + name;
+                try {
+                    const response = await fetchAssetWithRetry(url);
+                    const blob = await response.blob();
+                    files.push({
+                        name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
+                        input: blob
+                    });
+                } catch (e) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name} (${e.message})<br>`
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                }
+                gc += 1;
+                const assetSpan = downloadElem.querySelector("span#assetGath");
+                if (assetSpan) assetSpan.innerHTML = ` ${gc}/${imgAssests.length} `;
             }
-            const blob = await response.blob();
-
-            files.push({
-                name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
-                input: blob
-            });
-
-            gc+=1;
-            downloadElem.querySelector("span#assetGath").innerHTML = ` ${gc}/${imgAssests.length} `;
-        })()));
+        }
+        await Promise.all(
+            Array.from({length: Math.min(ASSET_CONCURRENCY, assetQueue.length)}, assetWorker)
+        );
     }
     function enforceEpubXHTML(metaId, url, htmlString, assetRegistry, links) {
         const parser = new DOMParser();
@@ -989,6 +1036,34 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             spine.appendChild(itemref);
         });
 
+        // Identify the cover image so readers pick the right thumbnail
+        // (without cover metadata, they guess — sometimes wrongly).
+        function imgSrcOf(html, onlyDocCover) {
+            const tag = html.match(onlyDocCover
+                ? /<img[^>]*role=["']doc-cover["'][^>]*>/i
+                : /<img[^>]*>/i);
+            if (!tag) return null;
+            const src = tag[0].match(/src=["']([^"']+)["']/i);
+            return src ? src[1] : null;
+        }
+        function isChapterFile(f) {
+            return typeof f.input === "string" && /\.(xhtml|html)$/.test(f.name);
+        }
+        let coverHref = null;
+        // An image explicitly marked as the cover wins, wherever it is.
+        for (const f of files) {
+            if (!isChapterFile(f)) continue;
+            coverHref = imgSrcOf(f.input, true);
+            if (coverHref) break;
+        }
+        // Otherwise, the first image of the first spine chapter
+        // (chapter files are pushed in spine order).
+        if (!coverHref) {
+            const firstChapter = files.find(isChapterFile);
+            if (firstChapter) coverHref = imgSrcOf(firstChapter.input, false);
+        }
+        let coverId = null;
+
         assetRegistry.forEach(asset => {
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
             let aname = asset.startsWith("http") ? getFilenameFromURL(asset) : asset;
@@ -1000,8 +1075,19 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             idStore.push(id);
             item.setAttribute('href', aname);
             item.setAttribute('media-type', getMimeTypeFromFileName(aname));
+            if (coverHref && aname === coverHref) {
+                item.setAttribute('properties', 'cover-image'); // EPUB 3 cover
+                coverId = id;
+            }
             manifest.appendChild(item);
         });
+
+        if (coverId) {
+            const coverMeta = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            coverMeta.setAttribute('name', 'cover'); // EPUB 2 cover
+            coverMeta.setAttribute('content', coverId);
+            metadata.appendChild(coverMeta);
+        }
 
         // Step 5: Serialize the document to a string
         const serializer = new XMLSerializer();
