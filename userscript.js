@@ -989,6 +989,34 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             spine.appendChild(itemref);
         });
 
+        // Identify the cover image so readers pick the right thumbnail
+        // (without cover metadata, they guess — sometimes wrongly).
+        function imgSrcOf(html, onlyDocCover) {
+            const tag = html.match(onlyDocCover
+                ? /<img[^>]*role=["']doc-cover["'][^>]*>/i
+                : /<img[^>]*>/i);
+            if (!tag) return null;
+            const src = tag[0].match(/src=["']([^"']+)["']/i);
+            return src ? src[1] : null;
+        }
+        function isChapterFile(f) {
+            return typeof f.input === "string" && /\.(xhtml|html)$/.test(f.name);
+        }
+        let coverHref = null;
+        // An image explicitly marked as the cover wins, wherever it is.
+        for (const f of files) {
+            if (!isChapterFile(f)) continue;
+            coverHref = imgSrcOf(f.input, true);
+            if (coverHref) break;
+        }
+        // Otherwise, the first image of the first spine chapter
+        // (chapter files are pushed in spine order).
+        if (!coverHref) {
+            const firstChapter = files.find(isChapterFile);
+            if (firstChapter) coverHref = imgSrcOf(firstChapter.input, false);
+        }
+        let coverId = null;
+
         assetRegistry.forEach(asset => {
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
             let aname = asset.startsWith("http") ? getFilenameFromURL(asset) : asset;
@@ -1000,8 +1028,19 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             idStore.push(id);
             item.setAttribute('href', aname);
             item.setAttribute('media-type', getMimeTypeFromFileName(aname));
+            if (coverHref && aname === coverHref) {
+                item.setAttribute('properties', 'cover-image'); // EPUB 3 cover
+                coverId = id;
+            }
             manifest.appendChild(item);
         });
+
+        if (coverId) {
+            const coverMeta = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            coverMeta.setAttribute('name', 'cover'); // EPUB 2 cover
+            coverMeta.setAttribute('content', coverId);
+            metadata.appendChild(coverMeta);
+        }
 
         // Step 5: Serialize the document to a string
         const serializer = new XMLSerializer();
