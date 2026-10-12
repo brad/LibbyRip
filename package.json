@@ -1,0 +1,16 @@
+{
+  "name": "libbyrip",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node build.mjs --dev",
+    "build": "node build.mjs",
+    "preview": "echo 'Preview not implemented'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "vite-plugin-monkey": "^3.5.2",
+    "terser": "^5.31.0"
+  }
+}
