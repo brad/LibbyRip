@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-06-01
+// @version       2026-10-11
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
 // @supportURL    https://github.com/PsychedelicPalimpsest/LibbyRip/issues
 // @match         *://*.listen.libbyapp.com/*
 // @match         *://*.listen.overdrive.com/*
-// @match         *://*.read.libbyapp.com/?*
-// @match         *://*.read.overdrive.com/?*
+// @match         *://*.read.libbyapp.com/*
+// @match         *://*.read.overdrive.com/*
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
 // @grant         none
@@ -589,45 +589,78 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
            <a class="pLink" id="download"> <h1> Download EPUB </h1> </a>
         </div>
     `;
-    const pages = window.pages = {};
 
-    // Libby used the bind method as a way to "safely" expose
-    // the decryption module. THIS IS THEIR DOWNFALL.
-    // As we can hook bind, allowing us to obtain the
-    // decryption function
-    const originalBind = Function.prototype.bind;
-    Function.prototype.bind = function(...args) {
-        const boundFn = originalBind.apply(this, args);
+    // NOTE: Libby used to expose chapter decryption client-side (via a
+    // Function.prototype.bind hook that captured the decryption function, and
+    // a window.__bif_cfc1 callback that fed a window.pages index). As of
+    // ~Oct 2026 the libbyapp.com reader serves chapters pre-decrypted from
+    // signed URLs, so that whole mechanism was removed (2026-10-11 cleanup).
 
-        // Store bound arguments (excluding `this`) for potential decryption function
-        boundFn.__boundArgs = args.slice(1);
 
-        // Also store the original function for debugging
-        boundFn.__originalFunction = this;
-
-        // If this looks like a decryption function, store it globally
-        if (this.toString().includes('decryption') ||
-            args.some(arg => typeof arg === 'function' && arg.toString().includes('decryption'))) {
-            console.log("Decryption function detected:", this);
-            window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
+    // Libby (as of ~Oct 2026 on the libbyapp.com reader) serves every chapter as
+    // plain, already-decrypted XHTML from a signed per-chapter URL, so there is
+    // no client-side decryption step anymore: a chapter is ready as soon as its
+    // iframe has a src.
+    function chapterUrl(c){
+        const f = c.sheetBox && c.sheetBox.querySelector("iframe");
+        return (f && f.src) ? f.src : null;
+    }
+    // Libby encrypts chapter bodies client-side (bifocal "rumi" module). Each
+    // chapter shell is just <head> (styles) + <body><script>
+    // parent.__bif_cfc1(self,'<edata>')</script></body>. The edata is base64
+    // with every 4-char group's 1st and 4th characters swapped; decoding it
+    // yields the real <body>...</body> HTML. This replicates Libby's own
+    // __bif_cfc1 decryptor so the download doesn't depend on their globals.
+    //
+    // Returns {html, status}. Status is one of:
+    //   "decrypted"     - payload found and decrypted into a real <body>
+    //   "unencrypted"   - no payload and no <script> in the body (cover, title, ...)
+    //   "unknown-shell" - no payload match, but the body holds a <script>:
+    //                     the shell format changed and we cannot decrypt it
+    //   "decrypt-failed"- payload found but the transform threw
+    //   "bad-payload"   - payload decrypted to something that is not a <body>
+    function decryptChapterShell(shellHtml){
+        const m = shellHtml.match(/parent\.__bif_cfc1\(self,'([^']+)'\)/)
+               || shellHtml.match(/parent\.__bif_cfc0\(self,'([^']+)'\)/);
+        if (!m){
+            const hasScript = /<body[^>]*>[\s\S]*<script/i.test(shellHtml);
+            return {html: shellHtml, status: hasScript ? "unknown-shell" : "unencrypted"};
         }
-
-        return boundFn;
-    };
-
+        const isCfc1 = shellHtml.includes("__bif_cfc1");
+        let decrypted;
+        try{
+            const raw = m[1];
+            decrypted = atob(isCfc1 ? raw.replace(/(.)(.)(.)(.)/g, "$4$2$3$1") : raw);
+        }catch(e){
+            return {html: shellHtml, status: "decrypt-failed"};
+        }
+        if (!/^\s*<body/i.test(decrypted)){
+            return {html: shellHtml, status: "bad-payload"};
+        }
+        // Splice the decrypted <body> into the shell, keeping its <head> (styles).
+        const spliced = shellHtml.replace(/<body[^>]*>[\s\S]*<\/body>/i, ()=>decrypted);
+        return {html: spliced !== shellHtml ? spliced : shellHtml, status: "decrypted"};
+    }
 
     async function waitForChapters(callback){
         let components = getBookComponents();
         // Force all the chapters to load in.
         components.forEach(page =>{
-            if (undefined != window.pages[page.id]) return;
+            if (chapterUrl(page)) return;
             page._loadContent({callback: ()=>{}})
         });
-        // But its not instant, so we need to wait until they are all set (see: bifFound())
-        while (components.filter((page)=>undefined==window.pages[page.id]).length){
+        // But its not instant, so we need to wait until they are all set.
+        // Give up after 2 minutes rather than hanging forever.
+        const deadline = Date.now() + 120000;
+        while (components.filter((page)=>!chapterUrl(page)).length){
+            if (Date.now() > deadline){
+                console.warn("Timed out waiting for chapters: " +
+                    components.filter((page)=>!chapterUrl(page)).map(p=>p.id).join(", "));
+                break;
+            }
             await new Promise(r => setTimeout(r, 100));
             callback();
-            console.log(components.filter((page)=>undefined==window.pages[page.id]).length);
+            console.log(components.filter((page)=>!chapterUrl(page)).length);
         }
     }
     function getBookComponents(){
@@ -661,7 +694,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let gc = 0;
         await waitForChapters(()=>{
             gc+=1;
-            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=window.pages[page.id]).length}/${totComp}`;
+            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>chapterUrl(page)).length}/${totComp}`;
         });
 
         downloadElem.innerHTML += `Chapter gathering complete<br>`
@@ -672,7 +705,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         components.forEach(c=>{
             // Nothing that can be done here...
             if (c.sheetBox.querySelector("iframe") == null){
-                console.warn("!!!" + window.pages[c.id]);
+                console.warn("No iframe for chapter " + c.id);
                 return;
             }
             c.meta.id = c.meta.id || crypto.randomUUID()
@@ -689,38 +722,99 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
             });
         });
-        let url = location.origin;
-        for (let i of Object.keys(window.pages)){
-            if (idToIfram[i])
-                url = idToIfram[i].src;
+        // Chapters are fetched from their signed iframe URLs, then decrypted
+        // client-side (see decryptChapterShell): the served HTML is only a
+        // shell holding an encrypted payload.
+        let fetched = 0;
+        for (let c of components){
+            const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
+            if (!src){
+                console.warn("No chapter URL for " + c.id + ", skipping");
+                continue;
+            }
+            let res;
+            try {
+                res = await fetch(src, {credentials: "include"});
+            } catch(e) {
+                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id}: ${e}<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                continue;
+            }
+            if (!res.ok) {
+                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id} (HTTP ${res.status})<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                continue;
+            }
+            const chapter = decryptChapterShell(await res.text());
+            if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
+                const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
+                    ") - page will be empty";
+                console.warn(msg);
+                downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            }
             files.push({
-                name: "OEBPS/" + truncate(i),
-                input: fixXhtml(idToMetaId[i], url, window.pages[i], imgAssests, cssRegistry[i] || [])
+                name: "OEBPS/" + truncate(c.id),
+                input: fixXhtml(idToMetaId[c.id] || c.id, src, chapter.html, imgAssests, cssRegistry[c.id] || [])
             });
+            fetched += 1;
+            const acc = downloadElem.querySelector("span#chapAcc");
+            if (acc) acc.innerHTML = ` ${fetched}/${totComp}`;
         }
 
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
+        // Download assets with bounded concurrency and retries. Firing off
+        // hundreds of requests at once can get throttled (HTTP 429) by the
+        // CDN, and a single failed fetch used to mean a broken image/asset
+        // with no second chance.
+        const ASSET_CONCURRENCY = 6;
+        const ASSET_MAX_ATTEMPTS = 3;
+        async function fetchAssetWithRetry(url) {
+            let lastError = "unknown error";
+            for (let attempt = 1; attempt <= ASSET_MAX_ATTEMPTS; attempt++) {
+                try {
+                    const response = await fetch(url);
+                    if (response.status === 200) return response;
+                    lastError = "HTTP " + response.status;
+                    // Retry throttling and server errors; other 4xx won't recover.
+                    if (response.status !== 429 && response.status < 500) break;
+                } catch (e) {
+                    lastError = (e && e.message) ? e.message : String(e);
+                }
+                if (attempt < ASSET_MAX_ATTEMPTS) {
+                    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+                }
+            }
+            throw new Error(lastError);
+        }
 
         gc = 0;
-        await Promise.all(imgAssests.map(name=>(async function(){
-            const response = await fetch(name.startsWith("http") ? name : location.origin + "/" + name);
-            if (response.status != 200) {
-                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name}<br>`
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                return;
+        const assetQueue = imgAssests.slice();
+        async function assetWorker() {
+            while (assetQueue.length) {
+                const name = assetQueue.shift();
+                const url = name.startsWith("http") ? name : location.origin + "/" + name;
+                try {
+                    const response = await fetchAssetWithRetry(url);
+                    const blob = await response.blob();
+                    files.push({
+                        name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
+                        input: blob
+                    });
+                } catch (e) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name} (${e.message})<br>`
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                }
+                gc += 1;
+                const assetSpan = downloadElem.querySelector("span#assetGath");
+                if (assetSpan) assetSpan.innerHTML = ` ${gc}/${imgAssests.length} `;
             }
-            const blob = await response.blob();
-
-            files.push({
-                name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
-                input: blob
-            });
-
-            gc+=1;
-            downloadElem.querySelector("span#assetGath").innerHTML = ` ${gc}/${imgAssests.length} `;
-        })()));
+        }
+        await Promise.all(
+            Array.from({length: Math.min(ASSET_CONCURRENCY, assetQueue.length)}, assetWorker)
+        );
     }
     function enforceEpubXHTML(metaId, url, htmlString, assetRegistry, links) {
         const parser = new DOMParser();
@@ -731,7 +825,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         }
 
         // Convert all elements to lowercase tag names
-        const elements = doc.getElementsByTagName('*');
+        // (Array.from: getElementsByTagName returns a LIVE collection, and
+        // replacing elements while iterating it can skip nodes)
+        const elements = Array.from(doc.getElementsByTagName('*'));
         for (let el of elements) {
             const newElement = doc.createElement(el.tagName.toLowerCase());
 
@@ -749,10 +845,12 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             el.parentNode.replaceChild(newElement, el);
         }
 
+        let imgFound = 0;
         for (let el of elements) {
             if (el.tagName.toLowerCase() == "img" || el.tagName.toLowerCase() == "image"){
                 let src = el.getAttribute("src") || el.getAttribute("xlink:href");
                 if (!src) continue;
+                imgFound++;
 
                 if (!(src.startsWith("http://") ||  src.startsWith("https://"))){
                     src = (new URL(src, new URL(url))).toString();
@@ -766,6 +864,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                     el.setAttribute("xlink:href", truncate(src));
             }
         }
+        if (imgFound > 0) console.log(`LibreGRAB: ${metaId}: found ${imgFound} images`);
 
 
         // Ensure the <head> element exists with a <title>
@@ -942,6 +1041,34 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             spine.appendChild(itemref);
         });
 
+        // Identify the cover image so readers pick the right thumbnail
+        // (without cover metadata, they guess — sometimes wrongly).
+        function imgSrcOf(html, onlyDocCover) {
+            const tag = html.match(onlyDocCover
+                ? /<img[^>]*role=["']doc-cover["'][^>]*>/i
+                : /<img[^>]*>/i);
+            if (!tag) return null;
+            const src = tag[0].match(/src=["']([^"']+)["']/i);
+            return src ? src[1] : null;
+        }
+        function isChapterFile(f) {
+            return typeof f.input === "string" && /\.(xhtml|html)$/.test(f.name);
+        }
+        let coverHref = null;
+        // An image explicitly marked as the cover wins, wherever it is.
+        for (const f of files) {
+            if (!isChapterFile(f)) continue;
+            coverHref = imgSrcOf(f.input, true);
+            if (coverHref) break;
+        }
+        // Otherwise, the first image of the first spine chapter
+        // (chapter files are pushed in spine order).
+        if (!coverHref) {
+            const firstChapter = files.find(isChapterFile);
+            if (firstChapter) coverHref = imgSrcOf(firstChapter.input, false);
+        }
+        let coverId = null;
+
         assetRegistry.forEach(asset => {
             const item = doc.createElementNS('http://www.idpf.org/2007/opf', 'item');
             let aname = asset.startsWith("http") ? getFilenameFromURL(asset) : asset;
@@ -953,8 +1080,19 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             idStore.push(id);
             item.setAttribute('href', aname);
             item.setAttribute('media-type', getMimeTypeFromFileName(aname));
+            if (coverHref && aname === coverHref) {
+                item.setAttribute('properties', 'cover-image'); // EPUB 3 cover
+                coverId = id;
+            }
             manifest.appendChild(item);
         });
+
+        if (coverId) {
+            const coverMeta = doc.createElementNS('http://www.idpf.org/2007/opf', 'meta');
+            coverMeta.setAttribute('name', 'cover'); // EPUB 2 cover
+            coverMeta.setAttribute('content', coverId);
+            metadata.appendChild(coverMeta);
+        }
 
         // Step 5: Serialize the document to a string
         const serializer = new XMLSerializer();
@@ -1117,43 +1255,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let s = document.createElement("style");
         s.innerHTML = CSS;
         document.head.appendChild(s)
-
-        if (!window.__bif_cfc1){
-            alert("Injection failed! __bif_cfc1 not found");
-            return;
-        }
-
-        // Debug: Log the original function structure
-        console.log("Original __bif_cfc1:", window.__bif_cfc1);
-        console.log("__bif_cfc1.__boundArgs:", window.__bif_cfc1.__boundArgs);
-        const old_crf1 = window.__bif_cfc1;
-        window.__bif_cfc1 = (win, edata)=>{
-            // If the bind hook succeeds, then the first element of bound args
-            // will be the decryption function. So we just passivly build up an
-            // index of the pages!
-            if (old_crf1.__boundArgs && old_crf1.__boundArgs[0]) {
-                pages[win.name] = old_crf1.__boundArgs[0](edata);
-            } else {
-                console.warn("Bind args not found, trying alternative decryption method");
-                // Try global decryption function if available
-                if (window.__libregrab_decryption_fn) {
-                    try {
-                        pages[win.name] = window.__libregrab_decryption_fn(edata);
-                    } catch (error) {
-                        console.error("Global decryption function failed:", error);
-                    }
-                }
-                // Final fallback: try to extract decrypted content directly
-                try {
-                    pages[win.name] = old_crf1(win, edata);
-                } catch (error) {
-                    console.error("Failed to decrypt content:", error);
-                    console.log("Attempting raw edata extraction");
-                    pages[win.name] = edata; // Sometimes the edata is already decrypted
-                }
-            }
-            return old_crf1(win, edata);
-        };
 
         buildBookPirateUi();
     }
