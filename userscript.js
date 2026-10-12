@@ -605,6 +605,33 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         const f = c.sheetBox && c.sheetBox.querySelector("iframe");
         return (f && f.src) ? f.src : null;
     }
+    // Libby encrypts chapter bodies client-side (bifocal "rumi" module). Each
+    // chapter shell is just <head> (styles) + <body><script>
+    // parent.__bif_cfc1(self,'<edata>')</script></body>. The edata is base64
+    // with every 4-char group's 1st and 4th characters swapped; decoding it
+    // yields the real <body>...</body> HTML. This replicates Libby's own
+    // __bif_cfc1 decryptor so the download doesn't depend on their globals.
+    function decryptChapterShell(shellHtml){
+        const m = shellHtml.match(/parent\.__bif_cfc1\(self,'([^']+)'\)/)
+               || shellHtml.match(/parent\.__bif_cfc0\(self,'([^']+)'\)/);
+        if (!m) return shellHtml; // unencrypted chapter (cover, title page, ...)
+        const isCfc1 = shellHtml.includes("__bif_cfc1");
+        let decrypted;
+        try{
+            const raw = m[1];
+            decrypted = atob(isCfc1 ? raw.replace(/(.)(.)(.)(.)/g, "$4$2$3$1") : raw);
+        }catch(e){
+            console.warn("chapter decrypt failed, using shell as-is", e);
+            return shellHtml;
+        }
+        if (!/^\s*<body/i.test(decrypted)){
+            console.warn("chapter decrypt produced unexpected payload, using shell as-is");
+            return shellHtml;
+        }
+        // Splice the decrypted <body> into the shell, keeping its <head> (styles).
+        const spliced = shellHtml.replace(/<body[^>]*>[\s\S]*<\/body>/i, ()=>decrypted);
+        return spliced !== shellHtml ? spliced : shellHtml;
+    }
 
     async function waitForChapters(callback){
         let components = getBookComponents();
@@ -686,9 +713,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
             });
         });
-        // Chapters are fetched directly from their signed iframe URLs (Libby now
-        // serves them pre-decrypted); the old window.pages decryption index is
-        // no longer populated on the libbyapp.com reader.
+        // Chapters are fetched from their signed iframe URLs, then decrypted
+        // client-side (see decryptChapterShell): the served HTML is only a
+        // shell holding an encrypted payload.
         let fetched = 0;
         for (let c of components){
             const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
@@ -709,7 +736,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 downloadElem.scrollTo(0, downloadElem.scrollHeight);
                 continue;
             }
-            const html = await res.text();
+            const html = decryptChapterShell(await res.text());
             files.push({
                 name: "OEBPS/" + truncate(c.id),
                 input: fixXhtml(idToMetaId[c.id] || c.id, src, html, imgAssests, cssRegistry[c.id] || [])
