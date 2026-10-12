@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-06-01
+// @version       2026-10-11
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -616,18 +616,35 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     };
 
 
+    // Libby (as of ~Oct 2026 on the libbyapp.com reader) serves every chapter as
+    // plain, already-decrypted XHTML from a signed per-chapter URL, so there is
+    // no client-side decryption step anymore: a chapter is ready as soon as its
+    // iframe has a src. (The old window.pages / __bif_cfc1 decryption-index
+    // mechanism further below is dead on this path and kept only for reference.)
+    function chapterUrl(c){
+        const f = c.sheetBox && c.sheetBox.querySelector("iframe");
+        return (f && f.src) ? f.src : null;
+    }
+
     async function waitForChapters(callback){
         let components = getBookComponents();
         // Force all the chapters to load in.
         components.forEach(page =>{
-            if (undefined != window.pages[page.id]) return;
+            if (chapterUrl(page)) return;
             page._loadContent({callback: ()=>{}})
         });
-        // But its not instant, so we need to wait until they are all set (see: bifFound())
-        while (components.filter((page)=>undefined==window.pages[page.id]).length){
+        // But its not instant, so we need to wait until they are all set.
+        // Give up after 2 minutes rather than hanging forever.
+        const deadline = Date.now() + 120000;
+        while (components.filter((page)=>!chapterUrl(page)).length){
+            if (Date.now() > deadline){
+                console.warn("Timed out waiting for chapters: " +
+                    components.filter((page)=>!chapterUrl(page)).map(p=>p.id).join(", "));
+                break;
+            }
             await new Promise(r => setTimeout(r, 100));
             callback();
-            console.log(components.filter((page)=>undefined==window.pages[page.id]).length);
+            console.log(components.filter((page)=>!chapterUrl(page)).length);
         }
     }
     function getBookComponents(){
@@ -661,7 +678,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let gc = 0;
         await waitForChapters(()=>{
             gc+=1;
-            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=window.pages[page.id]).length}/${totComp}`;
+            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>chapterUrl(page)).length}/${totComp}`;
         });
 
         downloadElem.innerHTML += `Chapter gathering complete<br>`
@@ -689,14 +706,37 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
             });
         });
-        let url = location.origin;
-        for (let i of Object.keys(window.pages)){
-            if (idToIfram[i])
-                url = idToIfram[i].src;
+        // Chapters are fetched directly from their signed iframe URLs (Libby now
+        // serves them pre-decrypted); the old window.pages decryption index is
+        // no longer populated on the libbyapp.com reader.
+        let fetched = 0;
+        for (let c of components){
+            const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
+            if (!src){
+                console.warn("No chapter URL for " + c.id + ", skipping");
+                continue;
+            }
+            let res;
+            try {
+                res = await fetch(src, {credentials: "include"});
+            } catch(e) {
+                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id}: ${e}<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                continue;
+            }
+            if (!res.ok) {
+                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id} (HTTP ${res.status})<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                continue;
+            }
+            const html = await res.text();
             files.push({
-                name: "OEBPS/" + truncate(i),
-                input: fixXhtml(idToMetaId[i], url, window.pages[i], imgAssests, cssRegistry[i] || [])
+                name: "OEBPS/" + truncate(c.id),
+                input: fixXhtml(idToMetaId[c.id] || c.id, src, html, imgAssests, cssRegistry[c.id] || [])
             });
+            fetched += 1;
+            const acc = downloadElem.querySelector("span#chapAcc");
+            if (acc) acc.innerHTML = ` ${fetched}/${totComp}`;
         }
 
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
