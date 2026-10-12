@@ -749,25 +749,56 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
+        // Download assets with bounded concurrency and retries. Firing off
+        // hundreds of requests at once can get throttled (HTTP 429) by the
+        // CDN, and a single failed fetch used to mean a broken image/asset
+        // with no second chance.
+        const ASSET_CONCURRENCY = 6;
+        const ASSET_MAX_ATTEMPTS = 3;
+        async function fetchAssetWithRetry(url) {
+            let lastError = "unknown error";
+            for (let attempt = 1; attempt <= ASSET_MAX_ATTEMPTS; attempt++) {
+                try {
+                    const response = await fetch(url);
+                    if (response.status === 200) return response;
+                    lastError = "HTTP " + response.status;
+                    // Retry throttling and server errors; other 4xx won't recover.
+                    if (response.status !== 429 && response.status < 500) break;
+                } catch (e) {
+                    lastError = (e && e.message) ? e.message : String(e);
+                }
+                if (attempt < ASSET_MAX_ATTEMPTS) {
+                    await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+                }
+            }
+            throw new Error(lastError);
+        }
 
         gc = 0;
-        await Promise.all(imgAssests.map(name=>(async function(){
-            const response = await fetch(name.startsWith("http") ? name : location.origin + "/" + name);
-            if (response.status != 200) {
-                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name}<br>`
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                return;
+        const assetQueue = imgAssests.slice();
+        async function assetWorker() {
+            while (assetQueue.length) {
+                const name = assetQueue.shift();
+                const url = name.startsWith("http") ? name : location.origin + "/" + name;
+                try {
+                    const response = await fetchAssetWithRetry(url);
+                    const blob = await response.blob();
+                    files.push({
+                        name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
+                        input: blob
+                    });
+                } catch (e) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name} (${e.message})<br>`
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                }
+                gc += 1;
+                const assetSpan = downloadElem.querySelector("span#assetGath");
+                if (assetSpan) assetSpan.innerHTML = ` ${gc}/${imgAssests.length} `;
             }
-            const blob = await response.blob();
-
-            files.push({
-                name: "OEBPS/" + (name.startsWith("http") ? getFilenameFromURL(name) : name),
-                input: blob
-            });
-
-            gc+=1;
-            downloadElem.querySelector("span#assetGath").innerHTML = ` ${gc}/${imgAssests.length} `;
-        })()));
+        }
+        await Promise.all(
+            Array.from({length: Math.min(ASSET_CONCURRENCY, assetQueue.length)}, assetWorker)
+        );
     }
     function enforceEpubXHTML(metaId, url, htmlString, assetRegistry, links) {
         const parser = new DOMParser();
