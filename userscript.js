@@ -726,7 +726,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         // client-side (see decryptChapterShell): the served HTML is only a
         // shell holding an encrypted payload.
         let fetched = 0;
-        const statusCounts = {};
         for (let c of components){
             const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
             if (!src){
@@ -747,7 +746,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                 continue;
             }
             const chapter = decryptChapterShell(await res.text());
-            statusCounts[chapter.status] = (statusCounts[chapter.status] || 0) + 1;
             if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
                 const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
                     ") - page will be empty";
@@ -763,7 +761,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             const acc = downloadElem.querySelector("span#chapAcc");
             if (acc) acc.innerHTML = ` ${fetched}/${totComp}`;
         }
-        console.log("LibreGRAB: chapter decrypt summary: " + JSON.stringify(statusCounts));
 
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
@@ -828,7 +825,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         }
 
         // Convert all elements to lowercase tag names
-        const elements = doc.getElementsByTagName('*');
+        // (Array.from: getElementsByTagName returns a LIVE collection, and
+        // replacing elements while iterating it can skip nodes)
+        const elements = Array.from(doc.getElementsByTagName('*'));
         for (let el of elements) {
             const newElement = doc.createElement(el.tagName.toLowerCase());
 
@@ -846,10 +845,12 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             el.parentNode.replaceChild(newElement, el);
         }
 
+        let imgFound = 0;
         for (let el of elements) {
             if (el.tagName.toLowerCase() == "img" || el.tagName.toLowerCase() == "image"){
                 let src = el.getAttribute("src") || el.getAttribute("xlink:href");
                 if (!src) continue;
+                imgFound++;
 
                 if (!(src.startsWith("http://") ||  src.startsWith("https://"))){
                     src = (new URL(src, new URL(url))).toString();
@@ -863,6 +864,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                     el.setAttribute("xlink:href", truncate(src));
             }
         }
+        if (imgFound > 0) console.log(`LibreGRAB: ${metaId}: found ${imgFound} images`);
 
 
         // Ensure the <head> element exists with a <title>
@@ -1255,7 +1257,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         document.head.appendChild(s)
 
         buildBookPirateUi();
-        console.log("LibreGRAB: ebook UI ready (PR #4 instrumented build)");
     }
 
     function downloadEPUBBBtn(){
