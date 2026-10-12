@@ -589,38 +589,18 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
            <a class="pLink" id="download"> <h1> Download EPUB </h1> </a>
         </div>
     `;
-    const pages = window.pages = {};
 
-    // Libby used the bind method as a way to "safely" expose
-    // the decryption module. THIS IS THEIR DOWNFALL.
-    // As we can hook bind, allowing us to obtain the
-    // decryption function
-    const originalBind = Function.prototype.bind;
-    Function.prototype.bind = function(...args) {
-        const boundFn = originalBind.apply(this, args);
-
-        // Store bound arguments (excluding `this`) for potential decryption function
-        boundFn.__boundArgs = args.slice(1);
-
-        // Also store the original function for debugging
-        boundFn.__originalFunction = this;
-
-        // If this looks like a decryption function, store it globally
-        if (this.toString().includes('decryption') ||
-            args.some(arg => typeof arg === 'function' && arg.toString().includes('decryption'))) {
-            console.log("Decryption function detected:", this);
-            window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
-        }
-
-        return boundFn;
-    };
+    // NOTE: Libby used to expose chapter decryption client-side (via a
+    // Function.prototype.bind hook that captured the decryption function, and
+    // a window.__bif_cfc1 callback that fed a window.pages index). As of
+    // ~Oct 2026 the libbyapp.com reader serves chapters pre-decrypted from
+    // signed URLs, so that whole mechanism was removed (2026-10-11 cleanup).
 
 
     // Libby (as of ~Oct 2026 on the libbyapp.com reader) serves every chapter as
     // plain, already-decrypted XHTML from a signed per-chapter URL, so there is
     // no client-side decryption step anymore: a chapter is ready as soon as its
-    // iframe has a src. (The old window.pages / __bif_cfc1 decryption-index
-    // mechanism further below is dead on this path and kept only for reference.)
+    // iframe has a src.
     function chapterUrl(c){
         const f = c.sheetBox && c.sheetBox.querySelector("iframe");
         return (f && f.src) ? f.src : null;
@@ -689,7 +669,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         components.forEach(c=>{
             // Nothing that can be done here...
             if (c.sheetBox.querySelector("iframe") == null){
-                console.warn("!!!" + window.pages[c.id]);
+                console.warn("No iframe for chapter " + c.id);
                 return;
             }
             c.meta.id = c.meta.id || crypto.randomUUID()
@@ -1157,43 +1137,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let s = document.createElement("style");
         s.innerHTML = CSS;
         document.head.appendChild(s)
-
-        if (!window.__bif_cfc1){
-            alert("Injection failed! __bif_cfc1 not found");
-            return;
-        }
-
-        // Debug: Log the original function structure
-        console.log("Original __bif_cfc1:", window.__bif_cfc1);
-        console.log("__bif_cfc1.__boundArgs:", window.__bif_cfc1.__boundArgs);
-        const old_crf1 = window.__bif_cfc1;
-        window.__bif_cfc1 = (win, edata)=>{
-            // If the bind hook succeeds, then the first element of bound args
-            // will be the decryption function. So we just passivly build up an
-            // index of the pages!
-            if (old_crf1.__boundArgs && old_crf1.__boundArgs[0]) {
-                pages[win.name] = old_crf1.__boundArgs[0](edata);
-            } else {
-                console.warn("Bind args not found, trying alternative decryption method");
-                // Try global decryption function if available
-                if (window.__libregrab_decryption_fn) {
-                    try {
-                        pages[win.name] = window.__libregrab_decryption_fn(edata);
-                    } catch (error) {
-                        console.error("Global decryption function failed:", error);
-                    }
-                }
-                // Final fallback: try to extract decrypted content directly
-                try {
-                    pages[win.name] = old_crf1(win, edata);
-                } catch (error) {
-                    console.error("Failed to decrypt content:", error);
-                    console.log("Attempting raw edata extraction");
-                    pages[win.name] = edata; // Sometimes the edata is already decrypted
-                }
-            }
-            return old_crf1(win, edata);
-        };
 
         buildBookPirateUi();
     }
