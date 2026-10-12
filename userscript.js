@@ -1020,19 +1020,31 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             spine.appendChild(itemref);
         });
 
-        // Identify the cover image from cover.xhtml so readers pick the right
-        // thumbnail (without this, they guess — sometimes wrongly).
+        // Identify the cover image so readers pick the right thumbnail
+        // (without cover metadata, they guess — sometimes wrongly).
+        function imgSrcOf(html, onlyDocCover) {
+            const tag = html.match(onlyDocCover
+                ? /<img[^>]*role=["']doc-cover["'][^>]*>/i
+                : /<img[^>]*>/i);
+            if (!tag) return null;
+            const src = tag[0].match(/src=["']([^"']+)["']/i);
+            return src ? src[1] : null;
+        }
+        function isChapterFile(f) {
+            return typeof f.input === "string" && /\.(xhtml|html)$/.test(f.name);
+        }
         let coverHref = null;
-        const coverFile = files.find(f => /(^|\/)cover\.xhtml$/.test(f.name));
-        if (coverFile && typeof coverFile.input === "string") {
-            // Prefer the image explicitly marked as the cover, else the first image.
-            const docCoverImg = coverFile.input.match(/<img[^>]*role=["']doc-cover["'][^>]*>/i);
-            const firstImg = coverFile.input.match(/<img[^>]*>/i);
-            const imgTag = docCoverImg || firstImg;
-            if (imgTag) {
-                const srcMatch = imgTag[0].match(/src=["']([^"']+)["']/i);
-                if (srcMatch) coverHref = srcMatch[1];
-            }
+        // An image explicitly marked as the cover wins, wherever it is.
+        for (const f of files) {
+            if (!isChapterFile(f)) continue;
+            coverHref = imgSrcOf(f.input, true);
+            if (coverHref) break;
+        }
+        // Otherwise, the first image of the first spine chapter
+        // (chapter files are pushed in spine order).
+        if (!coverHref) {
+            const firstChapter = files.find(isChapterFile);
+            if (firstChapter) coverHref = imgSrcOf(firstChapter.input, false);
         }
         let coverId = null;
 
