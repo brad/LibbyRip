@@ -6,6 +6,8 @@ import { getUrls } from './libby/urls.js';
 import { pickSaveFile, requestSaveFromTopFrame, buildAudiobookSingleMp3, handleIframeDataMessage, requestFromIframe, setupIframeApi, setupIframeFetchHandler } from './utils/download.js';
 import { createAndDownloadMp3, exportChapters } from './libby/chapters.js';
 import { getDownloadZip } from './zip/client-zip.js';
+import { addEbookButton } from './ui/ebook-ui.js';
+import { ProgressDisplay } from './ui/progress.js';
 
 const LIBREGRAB_SAVE_REQUEST = 'LIBREGRAB_SAVE_REQUEST';
 const LIBREGRAB_SAVE_RESULT = 'LIBREGRAB_SAVE_RESULT';
@@ -461,6 +463,29 @@ function buildPirateUiLocal(): void {
   }
 }
 
+function isEbookReader(): boolean {
+  const parts = location.hostname.split('.');
+  return parts.length >= 2 && parts[parts.length - 3] === 'read';
+}
+
+function wireEbookButton(bif: BIF): void {
+  if (!isEbookReader()) return;
+  try {
+    addEbookButton(bif, {
+      getDownloadZip,
+      makeProgress: (container: HTMLElement) => {
+        const div = document.createElement('div');
+        container.appendChild(div);
+        const pd = new ProgressDisplay(div as HTMLDivElement);
+        return { add: (msg: string) => pd.add(msg), clear: () => pd.clear() };
+      },
+    });
+    console.log('[LibbyRip] Ebook button added');
+  } catch (e) {
+    console.error('[LibbyRip] Failed to add ebook button:', e);
+  }
+}
+
 function pageWindow(): Window & typeof globalThis {
   return (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
 }
@@ -515,28 +540,29 @@ function pageContextMain(): void {
   // TOP FRAME: Check for local BIF first (Overdrive: reader is top-level, no iframe).
   // On Libby, the reader is in a read.libbyapp.com iframe and BIF lives there;
   // on Overdrive, the reader IS the top frame and BIF is available locally.
-  const localBif = (window as any).BIF || (typeof unsafeWindow !== 'undefined' && (unsafeWindow as any).BIF);
-  if (localBif !== undefined && localBif?.map) {
-    console.log('[LibbyRip] Top frame: local BIF found (no-iframe reader, e.g. Overdrive)');
-    BIF = localBif;
-    // Expose the same API the iframe case provides, so UI code works uniformly.
-    setupIframeApi(
-      BIF,
-      odreadCmptParams,
-      getUrls,
-      getMetadata,
-      getAuthorString,
-      getNarratorString
-    );
-    setupIframeFetchHandler(fetchWithRetry);
-    try {
-      buildPirateUiLocal();
-      console.log('[LibbyRip] Top frame (local BIF): buildPirateUiLocal returned, uiBuilt=', uiBuilt);
-    } catch (e) {
-      console.error('[LibbyRip] Top frame (local BIF) build error:', e);
+  // BIF may not be ready at document-start; poll for local BIF before
+  // falling back to iframe messaging. Poll interval self-clears on success
+  // or after 30s.
+  const checkLocalBif = setInterval(() => {
+    const localBif = (window as any).BIF || (typeof unsafeWindow !== 'undefined' && (unsafeWindow as any).BIF);
+    if (localBif !== undefined && localBif?.map) {
+      clearInterval(checkLocalBif);
+      console.log('[LibbyRip] Top frame: local BIF found (no-iframe reader, e.g. Overdrive)');
+      BIF = localBif;
+      wireEbookButton(BIF);
+      setupIframeApi(BIF, odreadCmptParams, getUrls, getMetadata, getAuthorString, getNarratorString);
+      setupIframeFetchHandler(fetchWithRetry);
+      // Rebuild UI now that BIF is available (earlier build had null BIF)
+      uiBuilt = false;
+      try {
+        buildPirateUiLocal();
+        console.log('[LibbyRip] Top frame (local BIF): UI rebuilt with BIF');
+      } catch (e) {
+        console.error('[LibbyRip] Top frame (local BIF) build error:', e);
+      }
     }
-    return;
-  }
+  }, 500);
+  setTimeout(() => clearInterval(checkLocalBif), 30000);
 
   // TOP FRAME (Libby): no BIF here, it's in the iframe
   window.addEventListener('message', (event) => {
