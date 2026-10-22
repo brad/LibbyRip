@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-10-11
+// @version       2026-10-21
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -605,6 +605,13 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         const f = c.sheetBox && c.sheetBox.querySelector("iframe");
         return (f && f.src) ? f.src : null;
     }
+    // Standalone payload decryption (replicates the bifocal "rumi"
+    // transform): cfc1 payloads are base64 with each 4-char group's 1st
+    // and 4th characters swapped; cfc0 payloads are plain base64.
+    function decryptPayload(edata, isCfc1){
+        return atob(isCfc1 ? edata.replace(/(.)(.)(.)(.)/g, "$4$2$3$1") : edata);
+    }
+
     // Libby encrypts chapter bodies client-side (bifocal "rumi" module). Each
     // chapter shell is just <head> (styles) + <body><script>
     // parent.__bif_cfc1(self,'<edata>')</script></body>. The edata is base64
@@ -629,8 +636,7 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         const isCfc1 = shellHtml.includes("__bif_cfc1");
         let decrypted;
         try{
-            const raw = m[1];
-            decrypted = atob(isCfc1 ? raw.replace(/(.)(.)(.)(.)/g, "$4$2$3$1") : raw);
+            decrypted = decryptPayload(m[1], isCfc1);
         }catch(e){
             return {html: shellHtml, status: "decrypt-failed"};
         }
@@ -640,6 +646,59 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         // Splice the decrypted <body> into the shell, keeping its <head> (styles).
         const spliced = shellHtml.replace(/<body[^>]*>[\s\S]*<\/body>/i, ()=>decrypted);
         return {html: spliced !== shellHtml ? spliced : shellHtml, status: "decrypted"};
+    }
+
+
+    // Chapter capture: every chapter shell hands its payload to
+    // parent.__bif_cfc1 / __bif_cfc0 as its iframe loads. Wrapping those
+    // functions lets us decrypt and stash each chapter *during* the load
+    // waitForChapters already forces, instead of fetching every signed
+    // chapter URL a second time afterwards (each chapter was requested
+    // twice per download, which is both wasteful and conspicuous).
+    // Captured HTML is keyed by the chapter window's name, which the
+    // reader sets to the spine component id (the pre-PR#4 code indexed
+    // pages the same way). The original function is always called
+    // through so the reader renders normally.
+    const capturedChapters = {};
+    const realCfcHandlers = {};
+    function makeCfcCapture(kind){
+        const isCfc1 = kind === "__bif_cfc1";
+        return function(win, edata){
+            try {
+                const html = decryptPayload(edata, isCfc1);
+                if (win && win.name && /^\s*<body/i.test(html))
+                    capturedChapters[win.name] = html;
+            } catch(e) {
+                console.warn("LibreGRAB: chapter capture failed for " + kind, e);
+            }
+            const real = realCfcHandlers[kind];
+            if (typeof real === "function")
+                return real(win, edata);
+        };
+    }
+    function installCfcCapture(kind){
+        const wrapper = makeCfcCapture(kind);
+        if (typeof window[kind] === "function")
+            realCfcHandlers[kind] = window[kind];
+        try {
+            // A property trap, so a handler the reader defines *after*
+            // this runs is wrapped on assignment too.
+            Object.defineProperty(window, kind, {
+                configurable: true,
+                enumerable: true,
+                get(){ return wrapper; },
+                set(fn){
+                    if (typeof fn === "function" && fn !== wrapper)
+                        realCfcHandlers[kind] = fn;
+                }
+            });
+        } catch(e) {
+            window[kind] = wrapper;
+        }
+    }
+    function installChapterCapture(){
+        installCfcCapture("__bif_cfc1");
+        installCfcCapture("__bif_cfc0");
     }
 
     async function waitForChapters(callback){
@@ -722,45 +781,69 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
             });
         });
-        // Chapters are fetched from their signed iframe URLs, then decrypted
-        // client-side (see decryptChapterShell): the served HTML is only a
-        // shell holding an encrypted payload.
-        let fetched = 0;
+        // Chapters were captured and decrypted as their iframes loaded
+        // (see installChapterCapture), so most need no network request at
+        // all. Only chapters the capture missed (e.g. plain chapters,
+        // which never call __bif_cfc*, or one that loaded before the
+        // capture was installed) are fetched from their signed iframe
+        // URL, then decrypted client-side (see decryptChapterShell): the
+        // served HTML is only a shell holding an encrypted payload.
+        const capturedById = {};
+        components.forEach(c=>{
+            const iframe = idToIfram[c.id];
+            const html = capturedChapters[c.id] ||
+                (iframe && iframe.name ? capturedChapters[iframe.name] : undefined);
+            if (html) capturedById[c.id] = html;
+        });
+        const capturedCount = Object.keys(capturedById).length;
+        console.log(`LibreGRAB: captured ${capturedCount}/${totComp} chapters during load`);
+        downloadElem.innerHTML += `Captured ${capturedCount}/${totComp} chapters as they loaded<br>`;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+        let processed = 0;
+        let refetched = 0;
         for (let c of components){
             const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
             if (!src){
                 console.warn("No chapter URL for " + c.id + ", skipping");
                 continue;
             }
-            let res;
-            try {
-                res = await fetch(src, {credentials: "include"});
-            } catch(e) {
-                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id}: ${e}<br>`;
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                continue;
-            }
-            if (!res.ok) {
-                downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id} (HTTP ${res.status})<br>`;
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                continue;
-            }
-            const chapter = decryptChapterShell(await res.text());
-            if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
-                const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
-                    ") - page will be empty";
-                console.warn(msg);
-                downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
-                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            let chapterHtml = capturedById[c.id];
+            if (!chapterHtml){
+                refetched += 1;
+                let res;
+                try {
+                    res = await fetch(src, {credentials: "include"});
+                } catch(e) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id}: ${e}<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                    continue;
+                }
+                if (!res.ok) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id} (HTTP ${res.status})<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                    continue;
+                }
+                const chapter = decryptChapterShell(await res.text());
+                if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
+                    const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
+                        ") - page will be empty";
+                    console.warn(msg);
+                    downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                }
+                chapterHtml = chapter.html;
             }
             files.push({
                 name: "OEBPS/" + truncate(c.id),
-                input: fixXhtml(idToMetaId[c.id] || c.id, src, chapter.html, imgAssests, cssRegistry[c.id] || [])
+                input: fixXhtml(idToMetaId[c.id] || c.id, src, chapterHtml, imgAssests, cssRegistry[c.id] || [])
             });
-            fetched += 1;
+            processed += 1;
             const acc = downloadElem.querySelector("span#chapAcc");
-            if (acc) acc.innerHTML = ` ${fetched}/${totComp}`;
+            if (acc) acc.innerHTML = ` ${processed}/${totComp}`;
         }
+        if (refetched)
+            console.log(`LibreGRAB: re-fetched ${refetched} chapter(s) the capture missed`);
 
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
@@ -1255,6 +1338,9 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let s = document.createElement("style");
         s.innerHTML = CSS;
         document.head.appendChild(s)
+
+        // Start capturing chapters as they load, before any download.
+        installChapterCapture();
 
         buildBookPirateUi();
     }
