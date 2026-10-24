@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-10-21
+// @version       2026-10-22
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -660,6 +660,15 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     // pages the same way). The original function is always called
     // through so the reader renders normally.
     const capturedChapters = {};
+    // Plain chapters harvested from their frames during the gather
+    // pass: the reader recycles distant chapter frames as new ones
+    // load, so by build time a plain chapter's frame may be gone even
+    // though it loaded fine. Harvest while it is definitely alive.
+    const harvestedChapters = {};
+    // Stylesheet links per chapter, snapshotted at settle time for
+    // the same reason: they live in the chapter's frame document,
+    // which the reader may remove before build time.
+    const harvestedCss = {};
     const realCfcHandlers = {};
     function makeCfcCapture(kind){
         const isCfc1 = kind === "__bif_cfc1";
@@ -701,25 +710,121 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         installCfcCapture("__bif_cfc0");
     }
 
+    function chapterCaptureFor(c, idToIfram){
+        const iframe = idToIfram[c.id];
+        return capturedChapters[c.id] ||
+            (iframe && iframe.name ? capturedChapters[iframe.name] : undefined);
+    }
+    // A chapter is settled when its capture arrived, or its iframe has
+    // finished loading and no longer holds a shell script (a plain
+    // chapter that never calls __bif_cfc*, or a load the capture
+    // missed); those fall back to fetching in createContent.
+    // Read a chapter straight out of its already-loaded iframe instead
+    // of fetching its URL again from outside the iframe. Only for
+    // settled chapters the capture did not claim: plain chapters
+    // (covers, title pages) never call __bif_cfc*, and a rendered
+    // chapter's document no longer holds the shell script either.
+    // Returns null when the chapter is not safely readable this way.
+    function harvestLoadedChapter(c, idToIfram){
+        const iframe = idToIfram[c.id];
+        if (!iframe || !iframe.src) return null;
+        let doc;
+        try { doc = iframe.contentWindow && iframe.contentWindow.document; }
+        catch(e) { return null; }
+        if (!doc || !doc.documentElement || doc.readyState !== "complete")
+            return null;
+        if (doc.documentElement.innerHTML.includes("__bif_cfc"))
+            return null; // shell has not run yet (or capture is coming)
+        if (!doc.body || !doc.body.innerHTML.trim()) return null;
+        return doc.documentElement.outerHTML;
+    }
+    function chapterDocSettled(c, idToIfram){
+        const iframe = idToIfram[c.id];
+        if (!iframe || !iframe.src) return !iframe;
+        let doc;
+        try { doc = iframe.contentWindow && iframe.contentWindow.document; }
+        catch(e) { return true; }
+        if (!doc || !doc.documentElement) return false;
+        // An iframe whose src was assigned but which has not navigated
+        // yet still shows its initial about:blank document, which is
+        // "complete" and shell-free - that is NOT settled, the chapter
+        // has not even started loading.
+        if (!doc.URL || !doc.URL.startsWith("http")) return false;
+        return doc.readyState === "complete" &&
+            !doc.documentElement.innerHTML.includes("__bif_cfc");
+    }
+
+    // Load chapters one at a time, in spine order, waiting for each to
+    // settle (captured, or its document finished loading shell-free)
+    // before starting the next. Loading the whole spine at once is a
+    // burst no human reader produces; one by one in order looks like
+    // someone flipping through the book, and it makes the capture
+    // race-free. A chapter that does not settle within the timeout is
+    // left for the fallback fetch rather than stalling the download.
+    // A chapter URL suitable for resolving relative asset paths
+    // against, for chapters whose content we already hold (captured or
+    // harvested) but whose frame the reader has since recycled: the
+    // signed URL if the frame survives, else the chapter's own path
+    // on this origin (asset fetches work unsigned; the token in the
+    // signed URL is not needed for base resolution).
+    function chapterBaseUrl(c, idToIfram){
+        const f = idToIfram[c.id];
+        if (f && f.src) return f.src;
+        return location.origin + "/" + c.id;
+    }
+    // Names of spine chapters that have no file entry - used as a
+    // hard completeness check before the EPUB is written, so a
+    // partially-built book can never be saved silently.
+    function missingChapterFiles(files, components){
+        const names = new Set(files.map(f => f.name));
+        return components
+            .map(c => "OEBPS/" + truncate(c.id))
+            .filter(n => !names.has(n));
+    }
+
     async function waitForChapters(callback){
         let components = getBookComponents();
-        // Force all the chapters to load in.
-        components.forEach(page =>{
-            if (chapterUrl(page)) return;
-            page._loadContent({callback: ()=>{}})
-        });
-        // But its not instant, so we need to wait until they are all set.
-        // Give up after 2 minutes rather than hanging forever.
-        const deadline = Date.now() + 120000;
-        while (components.filter((page)=>!chapterUrl(page)).length){
-            if (Date.now() > deadline){
-                console.warn("Timed out waiting for chapters: " +
-                    components.filter((page)=>!chapterUrl(page)).map(p=>p.id).join(", "));
-                break;
+        for (let page of components){
+            const frameOf = () => page.sheetBox && page.sheetBox.querySelector("iframe");
+            if (!chapterUrl(page))
+                page._loadContent({callback: ()=>{}});
+            const deadline = Date.now() + 15000;
+            let retried = false;
+            while (Date.now() < deadline){
+                const f = frameOf();
+                if (f){
+                    const one = {}; one[page.id] = f;
+                    if (chapterCaptureFor(page, one) || chapterDocSettled(page, one))
+                        break;
+                    // src set but the frame never navigated (still
+                    // about:blank) - ask the reader to load it again.
+                    if (!retried && Date.now() > deadline - 12000){
+                        retried = true;
+                        page._loadContent({callback: ()=>{}});
+                    }
+                }
+                await new Promise(r => setTimeout(r, 200));
             }
-            await new Promise(r => setTimeout(r, 100));
+            // If the reader has already recycled nothing yet, this is
+            // the moment this chapter's frame is guaranteed alive:
+            // harvest plain chapters now (encrypted ones are captured).
+            const fNow = frameOf();
+            if (fNow){
+                const one = {}; one[page.id] = fNow;
+                try {
+                    const fdoc = fNow.contentWindow && fNow.contentWindow.document;
+                    if (fdoc){
+                        const links = Array.from(fdoc.querySelectorAll("link"))
+                            .map(l => l.href).filter(Boolean);
+                        if (links.length) harvestedCss[page.id] = links;
+                    }
+                } catch(e) { /* frame already gone; cssRegistry may miss it */ }
+                if (!chapterCaptureFor(page, one) && !harvestedChapters[page.id]){
+                    const h = harvestLoadedChapter(page, one);
+                    if (h) harvestedChapters[page.id] = h;
+                }
+            }
             callback();
-            console.log(components.filter((page)=>!chapterUrl(page)).length);
         }
     }
     function getBookComponents(){
@@ -750,10 +855,10 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.innerHTML += `Gathering chapters <span id="chapAcc"> 0/${totComp} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        let gc = 0;
+        let gatheredCount = 0;
         await waitForChapters(()=>{
-            gc+=1;
-            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>chapterUrl(page)).length}/${totComp}`;
+            gatheredCount += 1;
+            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${gatheredCount}/${totComp}`;
         });
 
         downloadElem.innerHTML += `Chapter gathering complete<br>`
@@ -762,23 +867,30 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let idToIfram = {};
         let idToMetaId = {};
         components.forEach(c=>{
-            // Nothing that can be done here...
+            // XML ids (OPF/NCX) may not start with a digit; some
+            // books' meta ids do. Prefix those (adopted from the
+            // conformance work in upstream PR #79).
+            const rawMetaId = c.meta.id || crypto.randomUUID();
+            c.meta.id = (/^[a-zA-Z_]/.test(rawMetaId) ? "" : "chap-") + rawMetaId;
+            idToMetaId[c.id] = c.meta.id;
+
             if (c.sheetBox.querySelector("iframe") == null){
-                console.warn("No iframe for chapter " + c.id);
+                // The reader recycled this chapter's frame after it
+                // loaded. Content survives via capture/harvest, and so
+                // do the stylesheet links snapshotted at settle time.
+                if (harvestedCss[c.id]) cssRegistry[c.id] = harvestedCss[c.id].slice();
+                else console.warn("No iframe for chapter " + c.id);
                 return;
             }
-            c.meta.id = c.meta.id || crypto.randomUUID()
-            idToMetaId[c.id] = c.meta.id;
             idToIfram[c.id] = c.sheetBox.querySelector("iframe");
 
             c.sheetBox.querySelector("iframe").contentWindow.document.querySelectorAll("link").forEach(link=>{
                 cssRegistry[c.id] = cssRegistry[c.id] || [];
                 cssRegistry[c.id].push(link.href);
-
-                if (imgAssests.includes(link.href)) return;
-                imgAssests.push(link.href);
-
-
+                // Not added to imgAssests here: assets are downloaded
+                // in line with their chapter (see the chapter loop), so
+                // each chapter's stylesheets join the asset list when
+                // that chapter is processed, not all upfront.
             });
         });
         // Chapters were captured and decrypted as their iframes loaded
@@ -788,11 +900,23 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         // capture was installed) are fetched from their signed iframe
         // URL, then decrypted client-side (see decryptChapterShell): the
         // served HTML is only a shell holding an encrypted payload.
+        // The capture fires when a chapter's shell script runs, which is
+        // after waitForChapters' job (getting every src set) is done, so
+        // harvesting immediately would race the loads and miss most
+        // chapters. Wait until every component is settled first.
+        const settleDeadline = Date.now() + 120000;
+        while (Date.now() < settleDeadline){
+            const pending = components.filter(c =>
+                !chapterCaptureFor(c, idToIfram) && !chapterDocSettled(c, idToIfram));
+            if (!pending.length) break;
+            const acc0 = downloadElem.querySelector("span#chapAcc");
+            if (acc0) acc0.innerHTML = ` ${totComp - pending.length}/${totComp}`;
+            await new Promise(r => setTimeout(r, 250));
+        }
+
         const capturedById = {};
         components.forEach(c=>{
-            const iframe = idToIfram[c.id];
-            const html = capturedChapters[c.id] ||
-                (iframe && iframe.name ? capturedChapters[iframe.name] : undefined);
+            const html = chapterCaptureFor(c, idToIfram);
             if (html) capturedById[c.id] = html;
         });
         const capturedCount = Object.keys(capturedById).length;
@@ -800,58 +924,14 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.innerHTML += `Captured ${capturedCount}/${totComp} chapters as they loaded<br>`;
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        let processed = 0;
-        let refetched = 0;
-        for (let c of components){
-            const src = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
-            if (!src){
-                console.warn("No chapter URL for " + c.id + ", skipping");
-                continue;
-            }
-            let chapterHtml = capturedById[c.id];
-            if (!chapterHtml){
-                refetched += 1;
-                let res;
-                try {
-                    res = await fetch(src, {credentials: "include"});
-                } catch(e) {
-                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id}: ${e}<br>`;
-                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                    continue;
-                }
-                if (!res.ok) {
-                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id} (HTTP ${res.status})<br>`;
-                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                    continue;
-                }
-                const chapter = decryptChapterShell(await res.text());
-                if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
-                    const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
-                        ") - page will be empty";
-                    console.warn(msg);
-                    downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
-                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
-                }
-                chapterHtml = chapter.html;
-            }
-            files.push({
-                name: "OEBPS/" + truncate(c.id),
-                input: fixXhtml(idToMetaId[c.id] || c.id, src, chapterHtml, imgAssests, cssRegistry[c.id] || [])
-            });
-            processed += 1;
-            const acc = downloadElem.querySelector("span#chapAcc");
-            if (acc) acc.innerHTML = ` ${processed}/${totComp}`;
-        }
-        if (refetched)
-            console.log(`LibreGRAB: re-fetched ${refetched} chapter(s) the capture missed`);
-
-        downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
+        // Assets (images, stylesheets) are downloaded in line with the
+        // chapters that reference them, instead of in one burst at the
+        // end: each chapter's assets are drained right after that
+        // chapter is processed. Downloads keep the bounded concurrency
+        // and retries the old final phase had.
+        downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/0 </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        // Download assets with bounded concurrency and retries. Firing off
-        // hundreds of requests at once can get throttled (HTTP 429) by the
-        // CDN, and a single failed fetch used to mean a broken image/asset
-        // with no second chance.
         const ASSET_CONCURRENCY = 6;
         const ASSET_MAX_ATTEMPTS = 3;
         async function fetchAssetWithRetry(url) {
@@ -873,8 +953,18 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             throw new Error(lastError);
         }
 
-        gc = 0;
-        const assetQueue = imgAssests.slice();
+        let gc = 0;
+        const assetQueue = [];
+        const assetQueued = new Set();
+        const assetDone = new Set();
+        function queueNewAssets(){
+            for (const a of imgAssests){
+                if (!assetQueued.has(a) && !assetDone.has(a)){
+                    assetQueued.add(a);
+                    assetQueue.push(a);
+                }
+            }
+        }
         async function assetWorker() {
             while (assetQueue.length) {
                 const name = assetQueue.shift();
@@ -890,14 +980,90 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
                     downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch ${name} (${e.message})<br>`
                     downloadElem.scrollTo(0, downloadElem.scrollHeight);
                 }
+                assetDone.add(name);
                 gc += 1;
                 const assetSpan = downloadElem.querySelector("span#assetGath");
                 if (assetSpan) assetSpan.innerHTML = ` ${gc}/${imgAssests.length} `;
             }
         }
-        await Promise.all(
-            Array.from({length: Math.min(ASSET_CONCURRENCY, assetQueue.length)}, assetWorker)
-        );
+        async function downloadPendingAssets(){
+            queueNewAssets();
+            await Promise.all(
+                Array.from({length: Math.min(ASSET_CONCURRENCY, assetQueue.length)}, assetWorker)
+            );
+        }
+
+        let processed = 0;
+        let harvested = 0;
+        let refetched = 0;
+        for (let c of components){
+            // Content first: captured and harvested chapters are used
+            // even when the reader has recycled their frame (no signed
+            // URL survives then, which used to skip them silently).
+            let chapterHtml = capturedById[c.id] || harvestedChapters[c.id];
+            if (chapterHtml && harvestedChapters[c.id] && !capturedById[c.id])
+                harvested += 1;
+            if (!chapterHtml){
+                chapterHtml = harvestLoadedChapter(c, idToIfram);
+                if (chapterHtml) harvested += 1;
+            }
+            const signedSrc = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
+            const src = signedSrc || chapterBaseUrl(c, idToIfram);
+            if (!chapterHtml && !signedSrc){
+                const msg = "No chapter content or URL for " + c.id + ", skipping";
+                console.warn(msg);
+                downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                continue;
+            }
+            if (!chapterHtml){
+                refetched += 1;
+                let res;
+                try {
+                    res = await fetch(signedSrc, {credentials: "include"});
+                } catch(e) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id}: ${e}<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                    continue;
+                }
+                if (!res.ok) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id} (HTTP ${res.status})<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                    continue;
+                }
+                const chapter = decryptChapterShell(await res.text());
+                if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
+                    const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
+                        ") - page will be empty";
+                    console.warn(msg);
+                    downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                }
+                chapterHtml = chapter.html;
+            }
+            for (const link of cssRegistry[c.id] || []){
+                if (!imgAssests.includes(link)) imgAssests.push(link);
+            }
+            files.push({
+                name: "OEBPS/" + truncate(c.id),
+                input: fixXhtml(idToMetaId[c.id] || c.id, src, chapterHtml, imgAssests, cssRegistry[c.id] || [])
+            });
+            await downloadPendingAssets();
+            processed += 1;
+            const acc = downloadElem.querySelector("span#chapAcc");
+            if (acc) acc.innerHTML = ` ${processed}/${totComp}`;
+        }
+        if (harvested){
+            console.log(`LibreGRAB: read ${harvested} chapter(s) from their loaded frames`);
+            downloadElem.innerHTML += `Read ${harvested} chapter(s) from their loaded frames<br>`;
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        }
+        if (refetched)
+            console.log(`LibreGRAB: re-fetched ${refetched} chapter(s) the capture missed`);
+
+        // Anything registered too late for its chapter's drain (should
+        // not happen, but do not lose assets silently).
+        await downloadPendingAssets();
     }
     function enforceEpubXHTML(metaId, url, htmlString, assetRegistry, links) {
         const parser = new DOMParser();
@@ -928,8 +1094,14 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             el.parentNode.replaceChild(newElement, el);
         }
 
+        // Re-query the document for this pass: the loop above replaced
+        // every element with a clone, so the snapshot's nodes are
+        // detached and setting attributes on them changes nothing.
+        // (That is why in-book images kept their ../images/ paths and
+        // rendered broken, even though the files were downloaded.)
+        const imgElements = Array.from(doc.getElementsByTagName('*'));
         let imgFound = 0;
-        for (let el of elements) {
+        for (let el of imgElements) {
             if (el.tagName.toLowerCase() == "img" || el.tagName.toLowerCase() == "image"){
                 let src = el.getAttribute("src") || el.getAttribute("xlink:href");
                 if (!src) continue;
@@ -1282,6 +1454,17 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         });
 
         await createContent(files, imageAssets);
+
+        // Hard completeness check (the lesson of a silently-corrupt
+        // EPUB whose middle chapters never made it into the file
+        // list): never save a book that is missing spine chapters.
+        const missing = missingChapterFiles(files, getBookComponents());
+        if (missing.length){
+            downloadElem.innerHTML += `<br><b>ERROR:</b> ${missing.length} of ${getBookComponents().length} chapter(s) missing from the EPUB (${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", ..." : ""}). The file was NOT saved - please report this.<br>`;
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            downloadState = -1;
+            return;
+        }
 
         makePackage(files, imageAssets);
         makeToc(files);
