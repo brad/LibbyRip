@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-10-22
+// @version       2026-10-25
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -10,6 +10,8 @@
 // @match         *://*.listen.overdrive.com/*
 // @match         *://*.read.libbyapp.com/*
 // @match         *://*.read.overdrive.com/*
+// @exclude       *://*.read.libbyapp.com/text/*
+// @exclude       *://*.read.overdrive.com/text/*
 // @run-at        document-start
 // @icon          https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
 // @grant         none
