@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-06-01
+// @version       2026-10-29
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -111,6 +111,56 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         return ret;
     }
 
+    // OverDrive stopped sending -odread-cmpt-params (upstream issue #82), so
+    // chapter URLs built from it end in "?undefined" and fetch as 502s. The
+    // player itself still requests working URLs, so record the media URLs it
+    // requests and prefer those when building chapter URLs. Capture can never
+    // break playback: every step is guarded.
+    let capturedPlayerUrls = new Map();
+    function partKeyFromUrl(u){
+        try { return decodeURIComponent(new URL(u, location.href).pathname.split("/").pop()); }
+        catch (e) { return null; }
+    }
+    function recordPlayerUrl(u){
+        try {
+            if (typeof u !== "string" || u.indexOf(".mp3") === -1) return;
+            let key = partKeyFromUrl(u);
+            if (key && !capturedPlayerUrls.has(key)) {
+                capturedPlayerUrls.set(key, u);
+                console.log("[LibreGRAB] Captured player URL for " + key);
+            }
+        } catch (e) {}
+    }
+    try {
+        let mediaProto = window.HTMLMediaElement ? HTMLMediaElement.prototype
+            : (window.HTMLAudioElement ? HTMLAudioElement.prototype : null);
+        if (mediaProto) {
+            let srcDesc = Object.getOwnPropertyDescriptor(mediaProto, "src");
+            if (srcDesc && srcDesc.set) {
+                Object.defineProperty(mediaProto, "src", {
+                    configurable: true,
+                    enumerable: srcDesc.enumerable,
+                    get: srcDesc.get,
+                    set: function(v){ try { recordPlayerUrl(v); } catch (e) {} return srcDesc.set.call(this, v); }
+                });
+            }
+            let origSetAttr = mediaProto.setAttribute;
+            mediaProto.setAttribute = function(name, value){
+                try { if (String(name).toLowerCase() === "src") recordPlayerUrl(value); } catch (e) {}
+                return origSetAttr.apply(this, arguments);
+            };
+        }
+    } catch (e) {}
+    function mergePerformanceMediaUrls(){
+        try {
+            let entries = performance.getEntriesByType("resource") || [];
+            for (let i = 0; i < entries.length; i++) {
+                let en = entries[i];
+                if ((en.initiatorType === "audio" || en.initiatorType === "media") && en.name) recordPlayerUrl(en.name);
+            }
+        } catch (e) {}
+    }
+
 
 
     const audioBookNav = `
@@ -152,9 +202,12 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     function getUrls(){
         let ret = [];
         for (let spine of BIF.objects.spool.components){
+            let partFile = null;
+            try { partFile = decodeURIComponent(spine.meta.path); } catch (e) { partFile = spine.meta.path; }
+            let captured = partFile ? capturedPlayerUrls.get(partFile) : null;
             let data = {
 
-                url: location.origin + "/" + spine.meta.path + "?" + odreadCmptParams[spine.spinePosition],
+                url: captured || location.origin + "/" + spine.meta.path + "?" + (odreadCmptParams || [])[spine.spinePosition],
                 index : spine.meta["-odread-spine-position"],
                 duration: spine.meta["audio-duration"],
                 size: spine.meta["-odread-file-bytes"],
@@ -433,6 +486,49 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         return ffmpegInitPromise;
     }
 
+    // Fill in any chapter URLs the player has not provided yet by driving the
+    // player itself through the missing parts: seeking to a part makes the
+    // player set that part's working URL on its audio element, which the
+    // capture hook records. No manual seeking needed. Parts whose URLs
+    // already carry a query are left alone, so players with working params
+    // (e.g. Libby) are untouched. The original position is always restored.
+    function hasWorkingUrl(u){
+        return /\?.+=/.test(u.url);
+    }
+    async function ensurePlayerUrls(urls){
+        mergePerformanceMediaUrls();
+        urls = getUrls();
+        let missing = urls.filter(function(u){ return !hasWorkingUrl(u); });
+        if (!missing.length) return getUrls();
+        let spool = BIF.objects && BIF.objects.spool;
+        let compass = BIF.objects && BIF.objects.compass;
+        if (!spool || !compass || typeof compass.at !== "function") return getUrls();
+        let origFloc = spool.focus ? spool.focus.floc : 0;
+        try {
+            for (let i = 0; i < missing.length; i++) {
+                let u = missing[i];
+                try {
+                    let place = compass.at({ floc: u.index });
+                    if (place && typeof place.seek === "function") place.seek();
+                } catch (e) {}
+                let waited = 0;
+                while (waited < 2000) {
+                    mergePerformanceMediaUrls();
+                    if (hasWorkingUrl(getUrls().filter(function(x){ return x.index === u.index; })[0] || u)) break;
+                    await new Promise(function(r){ setTimeout(r, 100); });
+                    waited += 100;
+                }
+            }
+        } finally {
+            try {
+                let back = compass.at({ floc: origFloc });
+                if (back && typeof back.seek === "function") back.seek();
+            } catch (e) {}
+        }
+        mergePerformanceMediaUrls();
+        return getUrls();
+    }
+
     function exportMP3(){
         if (downloadState != -1)
             return;
@@ -440,7 +536,18 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadState = 0;
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting MP3</b><br>";
-        createAndDownloadMp3(getUrls()).then((p)=>{});
+        ensurePlayerUrls(getUrls()).then(function(urls){
+            let bad = urls.filter(function(u){ return !hasWorkingUrl(u); });
+            if (bad.length) {
+                downloadElem.innerHTML += "<b>Cannot export:</b> no working URL for part(s) " + bad.map(function(u){ return u.index + 1; }).join(", ") + ". Try playing through those parts first, then export again.<br>";
+                downloadState = -1;
+                return;
+            }
+            createAndDownloadMp3(urls).then((p)=>{});
+        }).catch(function(err){
+            downloadElem.innerHTML += "<b>Error:</b> " + err.message + "<br>";
+            downloadState = -1;
+        });
     }
 
 
@@ -555,7 +662,18 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadState = 0;
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting export</b><br>";
-        createAndDownloadZip(getUrls(), true).then((p)=>{});
+        ensurePlayerUrls(getUrls()).then(function(urls){
+            let bad = urls.filter(function(u){ return !hasWorkingUrl(u); });
+            if (bad.length) {
+                downloadElem.innerHTML += "<b>Cannot export:</b> no working URL for part(s) " + bad.map(function(u){ return u.index + 1; }).join(", ") + ". Try playing through those parts first, then export again.<br>";
+                downloadState = -1;
+                return;
+            }
+            createAndDownloadZip(urls, true).then((p)=>{});
+        }).catch(function(err){
+            downloadElem.innerHTML += "<b>Error:</b> " + err.message + "<br>";
+            downloadState = -1;
+        });
     }
 
     // Main entry point for audiobooks
