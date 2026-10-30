@@ -1,8 +1,11 @@
 declare global {
-  var downloadZip: (files: Array<{ name: string; input: Blob | Uint8Array | string }>) => Promise<{ blob: () => Promise<Blob> }>;
+  // client-zip's downloadZip returns a Response: .blob() for the whole
+  // file, .body for streaming it. The body is what the EPUB download
+  // streams to disk; it is null when the stream is unavailable.
+  var downloadZip: (files: Array<{ name: string; input: Blob | Uint8Array | string }>) => Promise<{ blob: () => Promise<Blob>; body?: ReadableStream<Uint8Array> | null }>;
 }
 
-export async function getDownloadZip(): Promise<(files: Array<{ name: string; input: Blob | Uint8Array | string }>) => Promise<{ blob: () => Promise<Blob> }>> {
+export async function getDownloadZip(): Promise<(files: Array<{ name: string; input: Blob | Uint8Array | string }>) => Promise<{ blob: () => Promise<Blob>; body?: ReadableStream<Uint8Array> | null }>> {
   const page = pageWindow();
   if (page.downloadZip) return page.downloadZip;
   if (window.__libregrabClientZipReady) return window.__libregrabClientZipReady;

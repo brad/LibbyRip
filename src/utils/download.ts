@@ -92,6 +92,95 @@ function pageWindow(): Window & typeof globalThis {
   return (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
 }
 
+/**
+ * In-memory, seekable stand-in for a FileSystemFileHandle, for browsers
+ * without the File System Access API (Firefox/Zen). Buffers every write as
+ * a segment and triggers a blob download on close. Supports the
+ * seek-then-overwrite pattern buildAudiobookSingleMp3 uses to patch the
+ * Xing header: later segments win when composed at close.
+ */
+class MemoryWritable {
+  private segments: Array<{ offset: number; data: Uint8Array }> = [];
+  private length = 0;
+  private position = 0;
+  private closed = false;
+
+  constructor(private suggestedName: string) {}
+
+  private toBytes(data: unknown): Uint8Array {
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (typeof data === 'string') return new TextEncoder().encode(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (data && typeof data === 'object' && 'data' in (data as Record<string, unknown>)) {
+      return this.toBytes((data as Record<string, unknown>).data);
+    }
+    return new Uint8Array(data as ArrayLike<number>);
+  }
+
+  async write(data: Uint8Array | ArrayBuffer | ArrayBufferView | { type?: string; data?: unknown; position?: number }): Promise<void> {
+    if (this.closed) throw new Error('Writable is closed');
+    let bytes: Uint8Array;
+    let at = this.position;
+    if (data && typeof data === 'object' && ('data' in data || 'type' in data)) {
+      const opts = data as { data?: unknown; position?: number };
+      if (typeof opts.position === 'number') at = opts.position;
+      bytes = this.toBytes(opts.data);
+    } else {
+      bytes = this.toBytes(data);
+    }
+    this.segments.push({ offset: at, data: bytes });
+    this.position = at + bytes.length;
+    if (this.position > this.length) this.length = this.position;
+  }
+
+  async seek(position: number): Promise<void> {
+    if (this.closed) throw new Error('Writable is closed');
+    this.position = position;
+  }
+
+  async truncate(size: number): Promise<void> {
+    if (this.closed) throw new Error('Writable is closed');
+    this.length = size;
+    if (this.position > this.length) this.position = this.length;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.length > 0) {
+      const buf = new Uint8Array(this.length);
+      for (const seg of this.segments) {
+        if (seg.offset < this.length) {
+          buf.set(seg.data.subarray(0, Math.min(seg.data.length, this.length - seg.offset)), seg.offset);
+        }
+      }
+      const url = URL.createObjectURL(new Blob([buf], { type: 'audio/mpeg' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = this.suggestedName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+  }
+
+  async abort(): Promise<void> {
+    this.closed = true;
+  }
+}
+
+function memorySaveHandle(suggestedName: string): SaveHandle {
+  return {
+    name: suggestedName,
+    createWritable: async () => new MemoryWritable(suggestedName) as unknown as WritableStream,
+    createSyncAccessHandle: async (): Promise<never> => {
+      throw new Error('Sync access handles are not supported');
+    },
+  };
+}
+
 export async function pickSaveFile(suggestedName: string, types: Array<{ description: string; accept: Record<string, string[]> }>): Promise<SaveHandle> {
   if (window.top !== window.self) {
     throw new Error('pickSaveFile must be called from top frame');
@@ -99,14 +188,16 @@ export async function pickSaveFile(suggestedName: string, types: Array<{ descrip
   const w = pageWindow();
   const picker = w.showSaveFilePicker;
   if (typeof picker !== 'function') {
-    throw new Error('File System Access API is not available on this window');
+    // Firefox/Zen have no File System Access API: buffer in memory and
+    // download a blob on close instead of streaming to disk.
+    return memorySaveHandle(suggestedName);
   }
   return picker.call(w, { suggestedName, types });
 }
 
 interface BuildAudiobookOptions {
   urls: Array<{ url: string; index: number; duration: number; size: number; type: string }>;
-  metadata: { chapters?: Array<{ chapter_number: number }> };
+  metadata: { chapters?: Array<{ chapter_number: number; title?: string }> };
   coverBytes: Uint8Array | null;
   coverMime: string | null;
   fileHandle: SaveHandle;
@@ -128,8 +219,17 @@ export async function buildAudiobookSingleMp3(options: BuildAudiobookOptions): P
   progress('<b>Streaming single MP3...</b>');
 
   const chapterDurations = options.durationByChapter || Object.fromEntries(urls.map((u) => [u.index + 1, u.duration * 1000]));
+  // The BIF description arrives as a string or as { short, full };
+  // normalize to a plain string for the COMM frame (merged behavior).
+  const rawDescription: unknown = (BIF.map as { description?: unknown }).description;
+  const descriptionText =
+    typeof rawDescription === 'string'
+      ? rawDescription
+      : (rawDescription as { short?: string; full?: string } | null | undefined)?.short ||
+        (rawDescription as { short?: string; full?: string } | null | undefined)?.full ||
+        '';
   const buildTagOptions: BuildBookId3TagOptions = {
-    book: BIF.map,
+    book: { ...BIF.map, description: descriptionText },
     displayTitle,
     author,
     narrator,
@@ -145,7 +245,7 @@ const { tag, totalDurationMs } = buildBookId3Tag(buildTagOptions);
 
   // Fetch first chapter to get proto for Xing frame
   progress(`Fetching first chapter to determine audio format...`);
-  const firstChapter = await requestChapterFromIframe(urls[0].url, progress);
+  const firstChapter = await requestChapterFromIframe(urls[0].url, progress, fetchWithRetry);
   const proto = parseMpegHeader(firstChapter, 0);
   if (!proto) throw new Error('First chapter did not start with a valid MPEG frame');
 
@@ -167,10 +267,10 @@ const { tag, totalDurationMs } = buildBookId3Tag(buildTagOptions);
     await writable.write(firstAudio);
     progress(`Appended 1/${urls.length} (chapter ${urls[0].index}, ${firstFrames} frames, ${(audioBytes / 1e6).toFixed(1)} MB audio)`);
 
-    // Stream remaining chapters from iframe
+    // Stream remaining chapters
     for (let i = 1; i < urls.length; i++) {
       const url = urls[i];
-      const audio = await requestChapterFromIframe(url.url, progress);
+      const audio = await requestChapterFromIframe(url.url, progress, fetchWithRetry);
       if (!audio.length) throw new Error(`chapter ${url.index} had no MPEG frames`);
       const frames = countMpegFrames(audio);
       audioFrames += frames;
@@ -213,13 +313,30 @@ const { tag, totalDurationMs } = buildBookId3Tag(buildTagOptions);
   return true;
 }
 
-// Request chapter from iframe, receive chunked response
-async function requestChapterFromIframe(url: string, progress: (msg: string) => void): Promise<Uint8Array> {
-  const requestId = (globalThis.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random();
-  
+// Request chapter bytes: via the player iframe on Libby, or by direct fetch
+// in the frameless player page itself on OverDrive (same GET the iframe-side
+// handler would make, same retries, same ID3 strip).
+async function requestChapterFromIframe(
+  url: string,
+  progress: (msg: string) => void,
+  fetchWithRetry: (url: string, opts: RequestInit, label: string, progress: (msg: string) => void, maxAttempts?: number) => Promise<Response>,
+): Promise<Uint8Array> {
   const iframe = document.querySelector('iframe[src*="listen.libbyapp.com"]') as HTMLIFrameElement | null;
-  if (!iframe) throw new Error('Audiobook player iframe not found');
-  
+  if (!iframe) {
+    // No player iframe. Only fetch directly when a local BIF is present,
+    // i.e. this frame IS the player page (OverDrive's frameless reader).
+    // Anywhere else (e.g. Libby with the player not open) keep the clear
+    // error instead of attempting a fetch that cannot authenticate.
+    const localBif = (window as any).BIF;
+    if (!localBif?.map) throw new Error('Audiobook player iframe not found');
+    console.log('[LibbyRip] No player iframe; fetching chapter directly (frameless player):', url);
+    const res = await fetchWithRetry(url, { method: 'GET' }, 'chapter fetch', progress);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    return stripId3(bytes);
+  }
+
+  const requestId = (globalThis.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random();
+
   let iframeOrigin = '';
   try {
     iframeOrigin = new URL(iframe.src).origin;

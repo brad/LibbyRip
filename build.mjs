@@ -16,7 +16,10 @@ async function buildPageContext() {
         fileName: 'page-context',
       },
       outDir: 'dist',
-      minify: false,
+      minify: 'terser',
+      terserOptions: {
+        compress: { drop_console: false },
+      },
       css: { postcss: false },
       rollupOptions: {
         output: {
@@ -50,25 +53,22 @@ async function buildMain(pageContextCode) {
   const meta = `// ==UserScript==
 // @name         LibreGRAB
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      2026-10-29-fix5
 // @author       PsychedelicPalimpsest
-// @description  Download all the booty! - ID3 tagging enabled, no FFmpeg, streaming MP3
+// @description  Download all the booty! - TypeScript with OverDrive fixes
 // @license      MIT
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=libbyapp.com
-// @downloadURL  https://update.greasyfork.org/scripts/498782/LibreGRAB.user.js
-// @updateURL    https://update.greasyfork.org/scripts/498782/LibreGRAB.meta.js
 // @match        *://libbyapp.com/*
 // @match        *://*.libbyapp.com/*
 // @match        *://overdrive.com/*
 // @match        *://*.overdrive.com/*
 // @match        *://*.listen.libbyapp.com/*
 // @match        *://*.listen.overdrive.com/*
-// @match        *://*.read.libbyapp.com/?*
-// @match        *://*.read.overdrive.com/?*
+// @match        *://*.read.libbyapp.com/*
+// @match        *://*.read.overdrive.com/*
 // @connect      images.findawayworld.com
 // @connect      unpkg.com
-// @grant        GM.xmlHttpRequest
-// @grant        GM_xmlhttpRequest
+// @grant        none
 // @run-at       document-start
 // ==/UserScript==
 `;
@@ -84,7 +84,10 @@ async function buildMain(pageContextCode) {
         fileName: 'main',
       },
       outDir: 'dist',
-      minify: false,
+      minify: 'terser',
+      terserOptions: {
+        compress: { drop_console: false },
+      },
       css: { postcss: false },
       rollupOptions: {
         output: {

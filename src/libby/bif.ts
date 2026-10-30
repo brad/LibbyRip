@@ -13,9 +13,40 @@ export interface BIFMap {
   title: { main: string };
   description?: string;
   creator: Array<{ name: string; role: string }>;
+  language?: string[];
+  '-odread-buid'?: string;
   spine: Array<{ 'audio-duration': number; 'media-type': string; 'audio-bitrate': number; '-odread-original-path': string }>;
   series?: string[];
   nav?: { toc: Array<{ title: string; path: string }> };
+}
+
+/** One chapter of an ebook's spine (read.libbyapp.com reader). */
+export interface EbookSpineComponent {
+  id: string;
+  index: number;
+  meta: {
+    id?: string;
+    path: string;
+  };
+  block?: {
+    behavior?: string;
+  };
+  sheetBox: {
+    querySelector(selector: string): HTMLIFrameElement | null;
+  };
+  _loadContent(opts: { callback: () => void }): void;
+}
+
+export interface BIFReader {
+  _: {
+    context: {
+      spine: {
+        _: {
+          components: EbookSpineComponent[];
+        };
+      };
+    };
+  };
 }
 
 export interface BIFRoot {
@@ -38,6 +69,8 @@ export interface BIF {
         spinePosition: number;
       }>;
     };
+    /** Present on read.libbyapp.com (ebook reader); absent on the audiobook player. */
+    reader?: BIFReader;
   };
 }
 
