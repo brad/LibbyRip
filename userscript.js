@@ -17,17 +17,16 @@
 // @updateURL https://update.greasyfork.org/scripts/498782/LibreGRAB.meta.js
 // ==/UserScript==
 
-// Chrome (Tampermonkey/MV3) runs userscripts in an isolated JS world, meaning
-// overrides to JSON.parse and Function.prototype.bind never reach the page's
-// own execution context. The fix is to inject the main script body into the
-// real page world. client-zip is fetched here (where CSP does not apply to the
-// extension context) and injected into the page once it is ready.
+// Tampermonkey/MV3 runs userscripts in an isolated world, so JSON.parse
+// and Function.prototype.bind overrides never reach page code. Inject the
+// main body into the page world instead. client-zip is fetched here
+// (extension context, no CSP) and injected once ready.
 
 (function () {
     function mainCode() {
 
-    // Since the ffmpeg.js file is 50mb, it slows the page down too much
-    // to be in a "require" attribute, so we load it in async
+    // ffmpeg.js is 50 MB, too large for @require (stalls the page);
+    // load it async instead.
     function addFFmpegJs(){
         let scriptTag = document.createElement("script");
         scriptTag.setAttribute("type", "text/javascript");
@@ -49,9 +48,8 @@
     async function getDownloadZip() {
         if (window.downloadZip) return window.downloadZip;
         if (window.__libregrabClientZipReady) return window.__libregrabClientZipReady;
-        // Lazy: the client-zip promise must NOT exist at load. Creating it
-        // during parsing redirects the player to terms, so it is created
-        // only on first export use, long after the player initialized.
+        // Create the client-zip promise only on first export use, not at
+        // load: creating it during parsing redirects the player to terms.
         window.__libregrabClientZipReady = new Promise((resolve, reject) => {
             window.__libregrabResolveClientZip = resolve;
             window.__libregrabRejectClientZip = reject;
@@ -108,14 +106,48 @@
     .pChapLabel{
         font-size: 2em;
     }`;
+    // Reader UI lives in a closed shadow root: plain-DOM writes into the
+    // reader tree disturb it (audiobooks redirect to terms, ebooks
+    // navigate to the ToC). A display:contents host keeps the buttons in
+    // the progress bar position without touching the reader DOM.
+    function makeShadowUiHost(){
+        const host = document.createElement("div");
+        host.style.display = "contents";
+        const root = host.attachShadow({mode: "closed"});
+        const s = document.createElement("style");
+        s.innerHTML = CSS;
+        root.appendChild(s);
+        return {host, root};
+    }
+    // Mount a download nav in the progress bar and create the shared
+    // download panel. bindings maps a nav element id to its click
+    // handler; extra, if given, appends more panels between the nav
+    // and the download panel.
+    function buildReaderUi(navHtml, bindings, extra){
+        const {host, root} = makeShadowUiHost();
+        const nav = document.createElement("div");
+        nav.innerHTML = navHtml;
+        for (const [id, handler] of Object.entries(bindings))
+            nav.querySelector("#" + id).onclick = handler;
+        nav.classList.add("pNav");
+        const pbar = document.querySelector(".nav-progress-bar");
+        pbar.insertBefore(host, pbar.children[1]);
+        root.appendChild(nav);
+        if (extra) extra(root);
+        downloadElem = document.createElement("div");
+        downloadElem.classList.add("foldMenu");
+        downloadElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
+        root.appendChild(downloadElem);
+        return root;
+    }
     /* =========================================
               BEGIN AUDIOBOOK SECTION!
        =========================================
     */
 
 
-    // Libby, somewhere, gets the crypto stuff we need for mp3 urls, then removes it before adding it to the BIF.
-    // here, we simply hook json parse to get it for us!
+    // Libby strips the mp3 URL crypto params before adding them to the
+    // BIF; hook JSON.parse to capture them first.
 
     const old_parse = JSON.parse;
     let odreadCmptParams = null;
@@ -174,34 +206,18 @@
         <button class="shibui-button" style="background-color: white" id="dumpAll"> Download all </button><br>
     `;
     let chapterMenuElem;
-    let libreShadowHost = null;
-    let libreShadowRoot = null;
 
     function buildPirateUi(){
-        // Create the nav
-        let nav = document.createElement("div");
-        nav.innerHTML = audioBookNav;
-        nav.querySelector("#chap").onclick = viewChapters;
-        nav.querySelector("#down").onclick = exportMP3;
-        nav.querySelector("#exp").onclick = exportChapters;
-        nav.classList.add("pNav");
-        let pbar = document.querySelector(".nav-progress-bar");
-        pbar.insertBefore(libreShadowHost, pbar.children[1]);
-        libreShadowRoot.appendChild(nav);
+        buildReaderUi(audioBookNav, {chap: viewChapters, down: exportMP3, exp: exportChapters}, (root) => {
+            // Create the chapters menu
+            chapterMenuElem = document.createElement("div");
+            chapterMenuElem.classList.add("foldMenu");
+            chapterMenuElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
+            const urls = getUrls();
 
-        // Create the chapters menu
-        chapterMenuElem = document.createElement("div");
-        chapterMenuElem.classList.add("foldMenu");
-        chapterMenuElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
-        const urls = getUrls();
-
-        chapterMenuElem.innerHTML = chaptersMenu.replace("{CHAPTERS}", urls.length);
-        libreShadowRoot.appendChild(chapterMenuElem);
-
-        downloadElem = document.createElement("div");
-        downloadElem.classList.add("foldMenu");
-        downloadElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
-        libreShadowRoot.appendChild(downloadElem);
+            chapterMenuElem.innerHTML = chaptersMenu.replace("{CHAPTERS}", urls.length);
+            root.appendChild(chapterMenuElem);
+        });
     }
     function getUrls(){
         let ret = [];
@@ -696,13 +712,6 @@
 
     // Main entry point for audiobooks
     function bifFoundAudiobook(){
-        // New global style info
-        libreShadowHost = document.createElement("div");
-        libreShadowHost.style.display = "contents";
-        libreShadowRoot = libreShadowHost.attachShadow({mode: "closed"});
-        let s = document.createElement("style");
-        s.innerHTML = CSS;
-        libreShadowRoot.appendChild(s)
         if (odreadCmptParams == null){
             alert("odreadCmptParams not set, so cannot resolve book urls! Please try refreshing.")
             return;
@@ -728,12 +737,9 @@
            <a class="pLink" id="download"> <h1> Download EPUB </h1> </a>
         </div>
     `;
-    // NOTE: the old window.pages mechanism (a Function.prototype.bind
-    // hook feeding a pages index) is gone. Chapter gathering now uses
-    // the capture/decrypt helpers below, ported from fork PR #4: they
-    // decrypt each chapter shell as it loads instead of depending on
-    // the reader's own pages index, which no longer fills on the
-    // current reader.
+    // Chapter gathering decrypts each chapter shell as it loads
+    // (capture/decrypt helpers below) instead of depending on the
+    // reader's pages index, which no longer fills on the current reader.
 
 
     // A chapter is ready as soon as its iframe has a src: plain chapters
@@ -750,17 +756,13 @@
         return atob(isCfc1 ? edata.replace(/(.)(.)(.)(.)/g, "$4$2$3$1") : edata);
     }
 
-    // Each chapter shell is just <head> (styles) + <body><script>
-    // parent.__bif_cfc1(self,'<edata>')</script></body>. The edata is base64
-    // with every 4-char group's 1st and 4th characters swapped; decoding it
-    // yields the real <body>...</body> HTML. This replicates the reader's own
-    // __bif_cfc1 decryptor so the download doesn't depend on their globals.
-    //
-    // Returns {html, status}. Status is one of:
+    // A chapter shell is <head> (styles) + <body><script>
+    // parent.__bif_cfc1(self,'<edata>')</script></body>; decrypting the
+    // payload yields the real <body>. Returns {html, status}. Status is one of:
     //   "decrypted"     - payload found and decrypted into a real <body>
     //   "unencrypted"   - no payload and no <script> in the body (cover, title, ...)
-    //   "unknown-shell" - no payload match, but the body holds a <script>:
-    //                     the shell format changed and we cannot decrypt it
+    //   "unknown-shell" - no payload match, but the body holds a <script>
+    //                     (shell format changed, cannot decrypt it)
     //   "decrypt-failed"- payload found but the transform threw
     //   "bad-payload"   - payload decrypted to something that is not a <body>
     function decryptChapterShell(shellHtml){
@@ -786,15 +788,11 @@
     }
 
 
-    // Chapter capture: every chapter shell hands its payload to
-    // parent.__bif_cfc1 / __bif_cfc0 as its iframe loads. Wrapping those
-    // functions lets us decrypt and stash each chapter *during* the load
-    // waitForChapters already forces, instead of fetching every signed
-    // chapter URL a second time afterwards (each chapter was requested
-    // twice per download, which is both wasteful and conspicuous).
-    // Captured HTML is keyed by the chapter window's name, which the
-    // reader sets to the spine component id. The original function is
-    // always called through so the reader renders normally.
+    // Wrap parent.__bif_cfc1/__bif_cfc0 so each chapter shell's payload
+    // is decrypted and stashed as its iframe loads, instead of fetching
+    // every signed chapter URL again afterwards. Captured HTML is keyed
+    // by the chapter window's name (the spine component id); the original
+    // handler is always called through so the reader renders normally.
     const capturedChapters = {};
     // Plain chapters harvested from their frames during the gather
     // pass: the reader recycles distant chapter frames as new ones
@@ -913,19 +911,16 @@
 
     // Load chapters one at a time, in spine order, waiting for each to
     // settle (captured, or its document finished loading shell-free)
-    // before starting the next. Loading the whole spine at once is a
-    // burst no human reader produces; one by one in order looks like
-    // someone flipping through the book, and it makes the capture
-    // race-free. A chapter that does not settle within the timeout is
-    // left for the fallback fetch rather than stalling the download.
-    // OverDrive: the reader's background pagination pass never runs
-    // while a download is in progress, so waiting for it cannot work.
-    // The table of contents DOES force a chapter to load: clicking an
-    // entry jumps the reader there in ~1s and renders its frame. So:
-    // open the ToC, click each entry in order, harvest the frame it
-    // loads, then jump back to the chapter the download started on.
-    // Libby keeps the _loadContent + capture path (its chapters are
-    // encrypted shells, not plain docs).
+    // before starting the next: a burst no human reader produces, and
+    // one by one keeps the capture race-free. A chapter that does not
+    // settle within the timeout is left for the fallback fetch rather
+    // than stalling the download.
+    // OverDrive's background pagination pass never runs while a download
+    // is in progress, so gather by navigation instead: open the ToC,
+    // click each entry in order (each forces its frame to load in ~1s),
+    // harvest the frame it loads, then jump back to the chapter the
+    // download started on. Libby keeps the _loadContent + capture path
+    // (its chapters are encrypted shells, not plain docs).
     // Reader ToC helpers (hoisted: used by waitForChapters).
     // Pure DOM helpers; visibleIndex stays inside
     // waitForChapters (it needs the local components list).
@@ -1092,6 +1087,20 @@
                 }
             };
             const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            // Humanlike pacing: a reader pauses between actions and
+            // the pause varies, so navigation does not read as a
+            // machine-gun burst of identical steps. humanStep is the
+            // pause after a small move (a slider step); humanSettle
+            // is the longer pause after a bigger jump (a chapter
+            // change, the slider to an end, closing a sheet).
+            // These average about the same as the fixed sleeps they
+            // replace, so pacing is roughly budget-neutral.
+            const humanSleep = (minMs, maxMs) => {
+                const lo = Math.min(minMs, maxMs), hi = Math.max(minMs, maxMs);
+                return sleep(lo + Math.random() * (hi - lo));
+            };
+            const humanStep = () => humanSleep(800, 2500);
+            const humanSettle = () => humanSleep(1500, 3200);
             const startTitle = titleLine();
             const startIndex = visibleIndex();
             const done = new Set();
@@ -1118,13 +1127,17 @@
                 return false;
             };
             // Step the reader to a component index with its own Next /
-            // Previous Chapter controls (no ToC needed).
-            const gotoIndex = async (targetIdx) => {
+            // Previous Chapter controls (no ToC needed). dl overrides
+            // the gather deadline: the positioning pass runs on its
+            // own budget, so it passes its deadline in here instead
+            // of being cut off by the 15-min gather deadline.
+            const gotoIndex = async (targetIdx, dl) => {
+                const limit = (typeof dl === 'number' && dl > 0) ? dl : deadline;
                 // Direction of travel from where the reader starts.
                 const startCur = visibleIndex();
                 const forward = startCur < 0 ? true : startCur < targetIdx;
                 for (let step = 0; step < 30; step++) {
-                    if (Date.now() > deadline) return false;
+                    if (Date.now() > limit) return false;
                     const cur = visibleIndex();
                     if (cur === targetIdx) return true;
                     if (cur < 0) { await sleep(1000); continue; }
@@ -1163,9 +1176,27 @@
                 downloadElem.innerHTML += 'WARNING: table of contents empty; walking chapters with Next/Previous instead.<br>';
                 downloadElem.scrollTo(0, downloadElem.scrollHeight);
             }
+            // Visible index at the first and last ToC entries: the
+            // bounds of the chaptered body, used by the positioning
+            // pass below to tell front matter from back matter.
+            // Skip the Cover (idx 0) for the first bound: the ToC
+            // lists it as an entry, but it is front matter, not
+            // the start of the chaptered body. If it became
+            // firstTocIdx, no component could be "before the first
+            // ToC chapter" and the front matter would be
+            // misclassified as middle (last run: col1 front=false,
+            // so it got the chapter-button walk, which can never
+            // land on it).
+            let firstTocIdx = -1, lastTocIdx = -1;
             for (const title of entries) {
                 if (Date.now() > tocDeadline) break;
-                await gotoEntry(title);
+                if (await gotoEntry(title)) {
+                    const vi = visibleIndex();
+                    if (vi >= 0) {
+                        if (vi > 0 && firstTocIdx < 0) firstTocIdx = vi;
+                        lastTocIdx = vi;
+                    }
+                }
                 sweepSettled(done);
                 if (done.size >= components.length) break;
             }
@@ -1192,12 +1223,326 @@
                     // arrival: the last component (e.g. next-reads)
                     // may not register a visible index, yet its frame
                     // can still be loaded and harvestable. Give it a
-                    // moment to settle first.
-                    await sleep(2500);
+                    // moment to settle first (humanlike pause).
+                    await humanSettle();
                     sweepSettled(done);
                     if (done.size >= components.length) break;
                 }
                 sweepSettled(done);
+            }
+            // Positioning pass for components still missing after
+            // the ToC loop and the chapter walk. Two shapes need
+            // dedicated positioning because the reader's chapter
+            // jumps skip them, so neither the ToC loop nor the walk
+            // ever loads their frames. A front-matter component
+            // (before the first ToC chapter) only loads when the
+            // reader sits on or just past it: one Next Chapter
+            // click from the Cover lands just past the gap with its
+            // frame alive in the ~3-frame window (the jump lands on
+            // idx 4, alive [3,4,5], which covers idx 3 but not idx
+            // 2), and the reader's own "Next Page" button in the
+            // main menu steps one page at a time from the Cover,
+            // landing on idx 1, 2, 3 in turn to catch an earlier
+            // gap the jump overshoots. A
+            // back-matter component (after the last ToC chapter)
+            // only loads when the reader sits at the end: the End
+            // Of Book button lands there and preloads the
+            // neighbour. The page slider is NOT the mechanism: it
+            // does not move this reader in response to
+            // programmatic value sets (verified repeatedly), so
+            // slider sets are only a logged last-resort fallback.
+            // Position, sweep, re-check; never leave a component
+            // to the strict completeness check unvisited. No
+            // exclusions.
+            const stillLeft = () => {
+                const out = [];
+                components.forEach((c, i) => { if (!done.has(c.id)) out.push(i); });
+                return out;
+            };
+            const left = stillLeft();
+            if (left.length) {
+                // Positioning gets its own budget, set when the
+                // pass begins. The ToC loop and the chapter walk can
+                // consume the whole 15-min gather deadline and
+                // starve positioning (an earlier run left ~60s for
+                // a ~2-min positioning pass). Six minutes from the
+                // pass start covers the Next Page steps and the End Of
+                // Book retries at a human pace; the pass still
+                // cannot hang the run, because this budget bounds
+                // it.
+                const posDeadline = Date.now() + 360000;
+                const posT0 = Date.now();
+                // Positioning log: every action (slider set, button
+                // click, sweep result, early exit) goes to the panel
+                // and the console, so a silent no-op is visible.
+                const plog = (msg) => {
+                    const line = `[Positioning] ${msg}`;
+                    try { console.log(`[LibreGRAB] ${line}`); } catch(e) {}
+                    try {
+                        downloadElem.innerHTML += `${line}<br>`;
+                        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                    } catch(e) {}
+                };
+                plog(`starting, ${left.length} still missed (${left.map(i => components[i].id).join(', ')}); budget ${Math.round((posDeadline - posT0) / 1000)}s; visible idx ${visibleIndex()}; gathered ${done.size}/${components.length}`);
+                downloadElem.innerHTML += `Positioning for ${left.length} still-missed chapter(s)<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                // Make sure the chapter bar (slider, chapter
+                // buttons) is reachable: close the ToC/menu sheet
+                // if it is still open.
+                if (panelOpen()) {
+                    const mb = menuBtn();
+                    if (mb) { mb.click(); await humanSleep(900, 1800); }
+                }
+                // Page slider (input[type=range]): the reader's
+                // page control. It does NOT move this reader in
+                // response to programmatic value sets: the native
+                // setter + input/change/InputEvent change the
+                // displayed value but the reader stays put
+                // (verified repeatedly). So never rely on a slider
+                // set for navigation; it is only a logged
+                // last-resort fallback. Read min/max/value from the
+                // DOM for logging; never hardcode page numbers.
+                const sliderEl = () => {
+                    try { return document.querySelector('input[type=range]'); } catch(e) { return null; }
+                };
+                const setSlider = (val) => {
+                    const s = sliderEl();
+                    if (!s) return false;
+                    try {
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(s, String(val));
+                        s.dispatchEvent(new Event('input', {bubbles: true}));
+                        s.dispatchEvent(new Event('change', {bubbles: true}));
+                        return true;
+                    } catch(e) { return false; }
+                };
+                const sliderMax = () => { const s = sliderEl(); return s ? (parseInt(s.max, 10) || parseInt(s.getAttribute('max') || '0', 10) || 0) : 0; };
+                const sliderMin = () => { const s = sliderEl(); return s ? (parseInt(s.min, 10) || parseInt(s.getAttribute('min') || '1', 10) || 1) : 1; };
+                const sliderVal = () => { const s = sliderEl(); return s ? (parseInt(s.value, 10) || 0) : 0; };
+                // Is the target component's frame loaded right now?
+                const targetAlive = (idx) => {
+                    const f = components[idx].sheetBox && components[idx].sheetBox.querySelector('iframe');
+                    return !!(f && f.src);
+                };
+                // Slider set with logging. The slider's own value
+                // updates synchronously with the setter, so it is
+                // logged here; the reader's navigation (and the
+                // visible index) lags behind it, so the index and
+                // the target's alive state are logged by posState
+                // after the settle pause + sweep. A set that does
+                // nothing is visible here.
+                const posSetSlider = (val, why, idx) => {
+                    const ok = setSlider(val);
+                    plog(`slider ${why}: set ${val} -> ${ok ? 'ok' : 'FAILED (no slider or setter threw)'}; value now ${sliderVal()}`);
+                    return ok;
+                };
+                // State after a settle pause + sweep: visible index,
+                // slider value, whether the target's frame is alive
+                // and whether it is gathered.
+                const posState = (what, idx) => {
+                    plog(`${what}: visible idx ${visibleIndex()}, slider value ${sliderVal()}, target ${components[idx].id} alive: ${targetAlive(idx)}, gathered=${done.has(components[idx].id)}, total ${done.size}/${components.length}`);
+                };
+                const navBtn = (re) => [...document.querySelectorAll('button, a, [role="button"]')].find(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).trim();
+                    return re.test(label);
+                });
+                for (const idx of left) {
+                    if (Date.now() > posDeadline) { plog(`budget exhausted (${Math.round((Date.now() - posT0) / 1000)}s used), stopping positioning`); break; }
+                    if (done.has(components[idx].id)) continue;
+                    // Front matter = before the first ToC chapter;
+                    // back matter = after the last ToC chapter.
+                    // Without ToC bounds, fall back to the reader's
+                    // current position.
+                    const curIdx = visibleIndex();
+                    const isFront = firstTocIdx >= 0 ? idx < firstTocIdx : (curIdx >= 0 ? idx < curIdx : idx * 2 < components.length);
+                    const isBack = lastTocIdx >= 0 ? idx > lastTocIdx : (curIdx >= 0 ? idx > curIdx : idx * 2 >= components.length);
+                    plog(`component ${components[idx].id} (spine ${idx}): front=${isFront} back=${isBack}, visible idx=${curIdx}, gathered ${done.size}/${components.length}`);
+                    if (isFront) {
+                        // Go to the Cover with the chapter buttons,
+                        // then one Next Chapter click lands just
+                        // past the gap; sweep there. One more Next
+                        // step if the gap is wider. The slider set
+                        // to its min must NOT be the way to the
+                        // Cover: it does not move this reader, and
+                        // it returns "ok" (the displayed value
+                        // changes), so a fallback guarded on its
+                        // failure never runs; the Next Chapter
+                        // clicks would then step the reader from
+                        // wherever it actually is, not from the
+                        // Cover.
+                        await gotoIndex(0, posDeadline);
+                        plog('at Cover (chapter buttons)');
+                        await humanSettle();
+                        sweepSettled(done);
+                        posState('at Cover', idx);
+                        for (let attempt = 0; attempt < 2 && !done.has(components[idx].id) && Date.now() < posDeadline; attempt++) {
+                            const nb = navBtn(/next chapter/i);
+                            if (!nb) { plog('no Next Chapter button found'); break; }
+                            // A reader finds the button before
+                            // pressing it: a short variable pause
+                            // before the click.
+                            await humanSleep(300, 1000);
+                            nb.click();
+                            plog(`Next Chapter click (attempt ${attempt + 1})`);
+                            await humanSettle();
+                            sweepSettled(done);
+                            posState('after Next Chapter', idx);
+                        }
+                        if (!done.has(components[idx].id)) {
+                            // The chapter jump from the Cover lands
+                            // just past the gap (e.g. idx 4, alive
+                            // [3,4,5]), which covers the last
+                            // front-matter component but not an
+                            // earlier one (e.g. idx 2, which needs
+                            // the visible index to be 1, 2, or 3 to
+                            // load). The slider walk that used to
+                            // cover it does not work: the slider
+                            // does not move this reader in response
+                            // to programmatic value sets (verified
+                            // repeatedly), so a slider walk is a
+                            // silent no-op. Round trips through the
+                            // front matter with the chapter buttons
+                            // do not work either: the jump passes
+                            // through the gap without ever settling
+                            // in it (verified: three round trips,
+                            // col1 never alive). The mechanism that
+                            // does work is the reader's own "Next
+                            // Page" button in the main menu: one
+                            // click steps exactly one page (slider
+                            // +2 per click), so stepping from the
+                            // Cover lands on idx 1, 2, 3 in turn
+                            // and loads the gap component's frame.
+                            // The "Next Page" item is a list row;
+                            // clicking the row itself does nothing
+                            // -- the real control is the nested
+                            // button inside it. A plain DOM .click()
+                            // on that button is enough. Sweep after
+                            // every click; the frame is alive as
+                            // soon as the reader sits on it.
+                            // Return to the Cover first: the Next
+                            // Chapter attempts above left the reader
+                            // at idx 4, and the steps must start
+                            // from the Cover to land on 1, 2, 3.
+                            await gotoIndex(0, posDeadline);
+                            await humanSettle();
+                            sweepSettled(done);
+                            posState('back at Cover for Next Page', idx);
+                            plog(`front-matter Next Page steps for ${components[idx].id} (spine ${idx})`);
+                            if (!done.has(components[idx].id)) {
+                                // The nested button inside the
+                                // "Next Page" list row. The row's
+                                // label starts with "Next Page"; the
+                                // button inside it carries only the
+                                // arrow, so match the row and click
+                                // the button.
+                                const nextPageBtn = () => {
+                                    const rows = [...document.querySelectorAll('li, [role="menuitem"], [role="option"], button, a, [role="button"]')].filter(el => {
+                                        const r = el.getBoundingClientRect();
+                                        if (r.width === 0 || r.height === 0) return false;
+                                        const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).trim().replace(/\s+/g, ' ');
+                                        return /^next page/i.test(label);
+                                    });
+                                    if (!rows.length) return null;
+                                    const row = rows[0];
+                                    const inner = row.querySelector ? row.querySelector('button, a, [role="button"]') : null;
+                                    if (inner) return inner;
+                                    return (row.tagName === 'BUTTON' || row.tagName === 'A') ? row : null;
+                                };
+                                // Open the main menu: the sheet stays
+                                // open across clicks, so one open
+                                // covers all the steps. After a ToC
+                                // click the sheet can be showing the
+                                // ToC list instead, with no "Next
+                                // Page" visible; clicking MENU again
+                                // switches it back to the main menu.
+                                const openMainMenu = async () => {
+                                    for (let attempt = 0; attempt < 2; attempt++) {
+                                        if (nextPageBtn()) return true;
+                                        const mb = menuBtn();
+                                        if (!mb) { plog('Next Page steps: no MENU button'); return false; }
+                                        await humanSleep(300, 900);
+                                        mb.click();
+                                        await humanSleep(900, 1800);
+                                        if (nextPageBtn()) return true;
+                                    }
+                                    return !!nextPageBtn();
+                                };
+                                if (await openMainMenu()) {
+                                    for (let step = 0; step < 4 && !done.has(components[idx].id) && Date.now() < posDeadline; step++) {
+                                        const nb = nextPageBtn();
+                                        if (!nb) { plog('Next Page steps: button gone'); break; }
+                                        await humanSleep(300, 1000);
+                                        nb.click();
+                                        plog(`Next Page click (step ${step + 1})`);
+                                        await humanSettle();
+                                        sweepSettled(done);
+                                        posState(`after Next Page ${step + 1}`, idx);
+                                    }
+                                    if (Date.now() > posDeadline) plog('front-matter Next Page steps: positioning budget exhausted');
+                                    sweepSettled(done);
+                                } else {
+                                    plog('Next Page steps: main menu / button not found');
+                                }
+                            }
+                        }
+                    }
+                    if (!done.has(components[idx].id) && isBack) {
+                        // The page slider does NOT move this reader
+                        // in response to programmatic value sets
+                        // (native setter + input/change/InputEvent,
+                        // verified repeatedly: the displayed value
+                        // changes but the reader stays put). So the
+                        // slider-to-max + step-down is a silent
+                        // no-op and must not be the mechanism. The
+                        // "End Of Book" button (DOM .click()) does
+                        // move it: it lands on the last component
+                        // and preloads the neighbour, so a sweep
+                        // right after the click harvests the
+                        // missing back-matter component. Retry once
+                        // in case the preload is timing-dependent.
+                        // Its label carries the remaining page
+                        // count, so match on the text, not the
+                        // number.
+                        for (let attempt = 0; attempt < 2 && !done.has(components[idx].id) && Date.now() < posDeadline; attempt++) {
+                            const eb = navBtn(/end of book/i);
+                            if (!eb) { plog('no End Of Book button found'); break; }
+                            await humanSleep(300, 1000);
+                            eb.click();
+                            plog(`End Of Book click (attempt ${attempt + 1})`);
+                            await humanSettle();
+                            sweepSettled(done);
+                            posState('after End Of Book', idx);
+                        }
+                        if (!done.has(components[idx].id)) {
+                            // Last resort: the slider set. It does
+                            // not navigate this reader, but it is
+                            // harmless and may work on another book
+                            // or reader where the slider does
+                            // respond; log the outcome either way.
+                            if (posSetSlider(sliderMax(), 'to end (fallback)', idx)) {
+                                await humanSettle();
+                                sweepSettled(done);
+                                posState('after slider-to-end fallback', idx);
+                            } else plog('slider fallback unavailable');
+                        }
+                        if (Date.now() > posDeadline) plog('back matter: positioning budget exhausted');
+                        sweepSettled(done);
+                    }
+                    if (!done.has(components[idx].id) && !isFront && !isBack) {
+                        // Middle component the chapter walk missed:
+                        // retry the walk once.
+                        plog(`middle retry: walking to spine ${idx}`);
+                        await gotoIndex(idx, posDeadline);
+                        await humanSettle();
+                        sweepSettled(done);
+                        posState('middle retry', idx);
+                    }
+                    if (done.size >= components.length) break;
+                }
+                sweepSettled(done);
+                plog(`pass done in ${Math.round((Date.now() - posT0) / 1000)}s; gathered ${done.size}/${components.length}; still missed: ${stillLeft().map(i => components[i].id).join(', ') || 'none'}`);
             }
             // Jump back to the chapter the download started on.
             const backTitle = entries.find(t => t === startTitle) || entries.find(t => t.toLowerCase().indexOf(startTitle.toLowerCase().slice(0, 20)) >= 0) || entries[0];
@@ -1804,9 +2149,8 @@
 
         await createContent(files, imageAssets);
 
-        // Hard completeness check (ported from fork PR #4, same lesson
-        // as upstream PR #79's fail-incomplete): never save a book
-        // that is missing spine chapters.
+        // Hard completeness check: never save a book that is missing
+        // spine chapters.
         const missing = missingChapterFiles(files, getBookComponents());
         if (missing.length){
             downloadElem.innerHTML += `<br><b>ERROR:</b> ${missing.length} of ${getBookComponents().length} chapter(s) missing from the EPUB (${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", ..." : ""}). The file was NOT saved - please report this.<br>`;
@@ -1871,12 +2215,10 @@
         s.innerHTML = CSS;
         document.head.appendChild(s)
 
-        // Chapter capture (ported from fork PR #4): wrap the reader's
-        // __bif_cfc1/__bif_cfc0 handlers so each chapter shell's payload
-        // is decrypted and stashed as it loads, instead of depending on
-        // the reader's own pages index (the old mechanism, which no
-        // longer fills on the current reader). The original handlers
-        // are always called through so the reader renders normally.
+        // Wrap the reader's __bif_cfc1/__bif_cfc0 handlers so each
+        // chapter shell's payload is decrypted and stashed as it loads.
+        // The original handlers are always called through so the reader
+        // renders normally.
         installChapterCapture();
 
         buildBookPirateUi();
@@ -1900,30 +2242,7 @@
         });
     }
     function buildBookPirateUi(){
-        // All ebook UI lives in a closed shadow root, mirroring the
-        // audiobook fix: plain-DOM writes into the reader tree (nav into
-        // the progress bar, foldMenu div onto body) made the reader
-        // navigate to the ToC. The display:contents host keeps the button
-        // in the progress bar position without disturbing the reader DOM.
-        let ebookShadowHost = document.createElement("div");
-        ebookShadowHost.style.display = "contents";
-        let ebookShadowRoot = ebookShadowHost.attachShadow({mode: "closed"});
-        let s = document.createElement("style");
-        s.innerHTML = CSS;
-        ebookShadowRoot.appendChild(s);
-        // Create the nav
-        let nav = document.createElement("div");
-        nav.innerHTML = bookNav;
-        nav.querySelector("#download").onclick = downloadEPUBBBtn;
-        nav.classList.add("pNav");
-        let pbar = document.querySelector(".nav-progress-bar");
-        pbar.insertBefore(ebookShadowHost, pbar.children[1]);
-        ebookShadowRoot.appendChild(nav);
-
-        downloadElem = document.createElement("div");
-        downloadElem.classList.add("foldMenu");
-        downloadElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
-        ebookShadowRoot.appendChild(downloadElem);
+        buildReaderUi(bookNav, {download: downloadEPUBBBtn});
     }
 
     /* =========================================
@@ -1936,27 +2255,25 @@
        =========================================
     */
 
-    // The "BIF" contains all the info we need to download
-    // stuff, so we wait until the page is loaded, and the
-    // BIF is present, to inject the pirate menu.
-    // Delay UI until the player has fully initialized: building during
-    // load races the player's own setup and redirects (audiobooks: to
-    // terms; ebooks: to the ToC). Readiness = BIF + a progress bar whose
-    // child count is stable across polls, plus the audiobook-only spool
-    // components and bootstrap params. A throw while checking never
-    // escapes: keep polling.
+    // Wait until the player has fully initialized before building the UI:
+    // building during load races the player's setup and redirects
+    // (audiobooks: to terms; ebooks: to the ToC). Readiness is BIF present
+    // plus a stable progress bar; audiobooks also need spool components
+    // and bootstrap params. A throw while checking never escapes: keep polling.
     let __pbarCount = -1, __stablePolls = 0;
+    // The progress bar's child count must be stable across two polls
+    // before the UI is built.
+    function progressBarStable(pbar){
+        if (pbar.children.length !== __pbarCount) { __pbarCount = pbar.children.length; __stablePolls = 0; return false; }
+        return ++__stablePolls >= 2;
+    }
     let intr = setInterval(()=>{
         try {
             const pbar = document.querySelector(".nav-progress-bar");
             if (window.BIF == undefined || pbar == undefined) { __pbarCount = -1; __stablePolls = 0; return; }
             let mode = location.hostname.split(".")[1];
             if (mode != "listen") {
-                // Same stability gate as audiobooks: the ebook reader
-                // navigates to the ToC if our UI lands while it is still
-                // initializing, so wait for its progress bar to settle.
-                if (pbar.children.length !== __pbarCount) { __pbarCount = pbar.children.length; __stablePolls = 0; return; }
-                if (++__stablePolls < 2) return;
+                if (!progressBarStable(pbar)) return;
                 clearInterval(intr);
                 BIF = window.BIF;
                 bifFoundBook();
@@ -1966,8 +2283,7 @@
             const ready = spool && Array.isArray(spool.components) && spool.components.length > 0 &&
                 odreadCmptParams != null;
             if (!ready) { __pbarCount = -1; __stablePolls = 0; return; }
-            if (pbar.children.length !== __pbarCount) { __pbarCount = pbar.children.length; __stablePolls = 0; return; }
-            if (++__stablePolls < 2) return;
+            if (!progressBarStable(pbar)) return;
             clearInterval(intr);
             BIF = window.BIF;
             bifFoundAudiobook();
