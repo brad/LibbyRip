@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name          LibreGRAB
 // @namespace     http://tampermonkey.net/
-// @version       2026-06-01
+// @version       2026-11-10
 // @description   Download all the booty!
 // @author        PsychedelicPalimpsest
 // @license       MIT
@@ -17,23 +17,16 @@
 // @updateURL https://update.greasyfork.org/scripts/498782/LibreGRAB.meta.js
 // ==/UserScript==
 
-// Chrome (Tampermonkey/MV3) runs userscripts in an isolated JS world, meaning
-// overrides to JSON.parse and Function.prototype.bind never reach the page's
-// own execution context. The fix is to inject the main script body into the
-// real page world. client-zip is fetched here (where CSP does not apply to the
-// extension context) and injected into the page once it is ready.
+// Tampermonkey/MV3 runs userscripts in an isolated world, so JSON.parse
+// and Function.prototype.bind overrides never reach page code. Inject the
+// main body into the page world instead. client-zip is fetched here
+// (extension context, no CSP) and injected once ready.
 
 (function () {
-    const clientZipReadyCode = `
-window.__libregrabClientZipReady = new Promise((resolve, reject) => {
-    window.__libregrabResolveClientZip = resolve;
-    window.__libregrabRejectClientZip = reject;
-});
-`;
     function mainCode() {
 
-    // Since the ffmpeg.js file is 50mb, it slows the page down too much
-    // to be in a "require" attribute, so we load it in async
+    // ffmpeg.js is 50 MB, too large for @require (stalls the page);
+    // load it async instead.
     function addFFmpegJs(){
         let scriptTag = document.createElement("script");
         scriptTag.setAttribute("type", "text/javascript");
@@ -55,7 +48,25 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     async function getDownloadZip() {
         if (window.downloadZip) return window.downloadZip;
         if (window.__libregrabClientZipReady) return window.__libregrabClientZipReady;
-        throw new Error("client-zip did not load");
+        // Create the client-zip promise only on first export use, not at
+        // load: creating it during parsing redirects the player to terms.
+        window.__libregrabClientZipReady = new Promise((resolve, reject) => {
+            window.__libregrabResolveClientZip = resolve;
+            window.__libregrabRejectClientZip = reject;
+        });
+        fetch('https://unpkg.com/client-zip@2.5.0/worker.js')
+            .then(r => r.text())
+            .then(clientZipCode => {
+                const tag = document.createElement('script');
+                tag.textContent = clientZipCode + ';\nwindow.__libregrabResolveClientZip?.(window.downloadZip);';
+                (document.documentElement || document.head || document.body).appendChild(tag);
+                tag.remove();
+            })
+            .catch(error => {
+                console.error('LibreGRAB: failed to load client-zip', error);
+                window.__libregrabRejectClientZip?.(new Error('client-zip failed to load'));
+            });
+        return window.__libregrabClientZipReady;
     }
     const CSS = `
     .pNav{
@@ -69,9 +80,13 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         text-decoration-line: underline;
         padding: .25em;
         font-size: 1em;
+        cursor: pointer;
     }
     .foldMenu{
-        position: absolute;
+        position: fixed;
+        left: 0;
+        right: 0;
+        top: 8px;
         width: 100%;
         height: 0%;
         z-index: 1000;
@@ -91,14 +106,48 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     .pChapLabel{
         font-size: 2em;
     }`;
+    // Reader UI lives in a closed shadow root: plain-DOM writes into the
+    // reader tree disturb it (audiobooks redirect to terms, ebooks
+    // navigate to the ToC). A display:contents host keeps the buttons in
+    // the progress bar position without touching the reader DOM.
+    function makeShadowUiHost(){
+        const host = document.createElement("div");
+        host.style.display = "contents";
+        const root = host.attachShadow({mode: "closed"});
+        const s = document.createElement("style");
+        s.innerHTML = CSS;
+        root.appendChild(s);
+        return {host, root};
+    }
+    // Mount a download nav in the progress bar and create the shared
+    // download panel. bindings maps a nav element id to its click
+    // handler; extra, if given, appends more panels between the nav
+    // and the download panel.
+    function buildReaderUi(navHtml, bindings, extra){
+        const {host, root} = makeShadowUiHost();
+        const nav = document.createElement("div");
+        nav.innerHTML = navHtml;
+        for (const [id, handler] of Object.entries(bindings))
+            nav.querySelector("#" + id).onclick = handler;
+        nav.classList.add("pNav");
+        const pbar = document.querySelector(".nav-progress-bar");
+        pbar.insertBefore(host, pbar.children[1]);
+        root.appendChild(nav);
+        if (extra) extra(root);
+        downloadElem = document.createElement("div");
+        downloadElem.classList.add("foldMenu");
+        downloadElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
+        root.appendChild(downloadElem);
+        return root;
+    }
     /* =========================================
               BEGIN AUDIOBOOK SECTION!
        =========================================
     */
 
 
-    // Libby, somewhere, gets the crypto stuff we need for mp3 urls, then removes it before adding it to the BIF.
-    // here, we simply hook json parse to get it for us!
+    // Libby strips the mp3 URL crypto params before adding them to the
+    // BIF; hook JSON.parse to capture them first.
 
     const old_parse = JSON.parse;
     let odreadCmptParams = null;
@@ -109,6 +158,40 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         }
 
         return ret;
+    }
+
+    // OverDrive stopped sending -odread-cmpt-params (upstream issue #82), so
+    // chapter URLs built from it end in "?undefined" and fetch as 502s. The
+    // player itself still requests working URLs, so record the media URLs it
+    // requests and prefer those when building chapter URLs. Capture can never
+    // break playback: every step is guarded.
+    let capturedPlayerUrls = new Map();
+    function partKeyFromUrl(u){
+        try { return decodeURIComponent(new URL(u, location.href).pathname.split("/").pop()); }
+        catch (e) { return null; }
+    }
+    function recordPlayerUrl(u){
+        try {
+            if (typeof u !== "string" || u.indexOf(".mp3") === -1) return;
+            let key = partKeyFromUrl(u);
+            if (key && !capturedPlayerUrls.has(key)) {
+                capturedPlayerUrls.set(key, u);
+                console.log("[LibreGRAB] Captured player URL for " + key);
+            }
+        } catch (e) {}
+    }
+    // No HTMLMediaElement src/setAttribute patch: patching media prototypes
+    // is a suspected detection vector (OverDrive navigates to terms when it
+    // detects tampering), and capture via mergePerformanceMediaUrls()
+    // (performance entries) alone proved sufficient for every part.
+    function mergePerformanceMediaUrls(){
+        try {
+            let entries = performance.getEntriesByType("resource") || [];
+            for (let i = 0; i < entries.length; i++) {
+                let en = entries[i];
+                if ((en.initiatorType === "audio" || en.initiatorType === "media") && en.name) recordPlayerUrl(en.name);
+            }
+        } catch (e) {}
     }
 
 
@@ -125,36 +208,26 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
     let chapterMenuElem;
 
     function buildPirateUi(){
-        // Create the nav
-        let nav = document.createElement("div");
-        nav.innerHTML = audioBookNav;
-        nav.querySelector("#chap").onclick = viewChapters;
-        nav.querySelector("#down").onclick = exportMP3;
-        nav.querySelector("#exp").onclick = exportChapters;
-        nav.classList.add("pNav");
-        let pbar = document.querySelector(".nav-progress-bar");
-        pbar.insertBefore(nav, pbar.children[1]);
+        buildReaderUi(audioBookNav, {chap: viewChapters, down: exportMP3, exp: exportChapters}, (root) => {
+            // Create the chapters menu
+            chapterMenuElem = document.createElement("div");
+            chapterMenuElem.classList.add("foldMenu");
+            chapterMenuElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
+            const urls = getUrls();
 
-        // Create the chapters menu
-        chapterMenuElem = document.createElement("div");
-        chapterMenuElem.classList.add("foldMenu");
-        chapterMenuElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
-        const urls = getUrls();
-
-        chapterMenuElem.innerHTML = chaptersMenu.replace("{CHAPTERS}", urls.length);
-        document.body.appendChild(chapterMenuElem);
-
-        downloadElem = document.createElement("div");
-        downloadElem.classList.add("foldMenu");
-        downloadElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
-        document.body.appendChild(downloadElem);
+            chapterMenuElem.innerHTML = chaptersMenu.replace("{CHAPTERS}", urls.length);
+            root.appendChild(chapterMenuElem);
+        });
     }
     function getUrls(){
         let ret = [];
         for (let spine of BIF.objects.spool.components){
+            let partFile = null;
+            try { partFile = decodeURIComponent(spine.meta.path); } catch (e) { partFile = spine.meta.path; }
+            let captured = partFile ? capturedPlayerUrls.get(partFile) : null;
             let data = {
 
-                url: location.origin + "/" + spine.meta.path + "?" + odreadCmptParams[spine.spinePosition],
+                url: captured || location.origin + "/" + spine.meta.path + "?" + (odreadCmptParams || [])[spine.spinePosition],
                 index : spine.meta["-odread-spine-position"],
                 duration: spine.meta["audio-duration"],
                 size: spine.meta["-odread-file-bytes"],
@@ -433,6 +506,62 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         return ffmpegInitPromise;
     }
 
+    // Fill in any chapter URLs the player has not provided yet by driving the
+    // player itself through the missing parts: seeking to a part makes the
+    // player set that part's working URL on its audio element, which the
+    // capture hook records. No manual seeking needed. Parts whose URLs
+    // already carry a query are left alone, so players with working params
+    // (e.g. Libby) are untouched. The original position is always restored.
+    function hasWorkingUrl(u){
+        return /\?.+=/.test(u.url);
+    }
+    async function ensurePlayerUrls(urls){
+        mergePerformanceMediaUrls();
+        urls = getUrls();
+        let missing = urls.filter(function(u){ return !hasWorkingUrl(u); });
+        if (!missing.length) return getUrls();
+        let spool = BIF.objects && BIF.objects.spool;
+        let compass = BIF.objects && BIF.objects.compass;
+        if (!spool || !compass || typeof compass.at !== "function") return getUrls();
+        let origFloc = spool.focus ? spool.focus.floc : 0;
+        downloadElem.innerHTML += "Gathering audio <span id=\"sweepAcc\"></span><br>";
+        try {
+            for (let i = 0; i < missing.length; i++) {
+                let u = missing[i];
+                let sweepSpan = downloadElem.querySelector("span#sweepAcc"); if (sweepSpan) sweepSpan.textContent = "part " + (u.index + 1) + " of " + urls.length + "…";
+                try {
+                    let fracUsed = (u.index === urls.length - 1) ? (0.25 + Math.random() * 0.5) : (0.01 + Math.random() * 0.98); let place = compass.at({ floc: u.index + fracUsed });
+                    if (place && typeof place.seek === "function") place.seek();
+                } catch (e) {}
+                let waited = 0;
+                while (waited < 2000) {
+                    mergePerformanceMediaUrls();
+                    if (hasWorkingUrl(getUrls().filter(function(x){ return x.index === u.index; })[0] || u)) break;
+                    await new Promise(function(r){ setTimeout(r, 100); });
+                    waited += 100;
+                }
+                if (i < missing.length - 1) {
+                    await new Promise(function(r){ setTimeout(r, 400 + Math.random() * 1200); });
+                }
+            }
+            let settled = 0;
+            while (settled < 20000) {
+                mergePerformanceMediaUrls();
+                if (!getUrls().filter(function(x){ return !hasWorkingUrl(x); }).length) break;
+                await new Promise(function(r){ setTimeout(r, 500); });
+                settled += 500;
+            }
+        } finally {
+            try {
+                let back = compass.at({ floc: origFloc });
+                if (back && typeof back.seek === "function") back.seek();
+            } catch (e) {}
+            let sweepDone = downloadElem.querySelector("span#sweepAcc"); if (sweepDone) sweepDone.textContent = "complete";
+        }
+        mergePerformanceMediaUrls();
+        return getUrls();
+    }
+
     function exportMP3(){
         if (downloadState != -1)
             return;
@@ -440,7 +569,18 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadState = 0;
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting MP3</b><br>";
-        createAndDownloadMp3(getUrls()).then((p)=>{});
+        ensurePlayerUrls(getUrls()).then(function(urls){
+            let bad = urls.filter(function(u){ return !hasWorkingUrl(u); });
+            if (bad.length) {
+                downloadElem.innerHTML += "<b>Cannot export:</b> no working URL for part(s) " + bad.map(function(u){ return u.index + 1; }).join(", ") + ". Try playing through those parts first, then export again.<br>";
+                downloadState = -1;
+                return;
+            }
+            createAndDownloadMp3(urls).then((p)=>{});
+        }).catch(function(err){
+            downloadElem.innerHTML += "<b>Error:</b> " + err.message + "<br>";
+            downloadState = -1;
+        });
     }
 
 
@@ -555,15 +695,23 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadState = 0;
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting export</b><br>";
-        createAndDownloadZip(getUrls(), true).then((p)=>{});
+        ensurePlayerUrls(getUrls()).then(function(urls){
+            let bad = urls.filter(function(u){ return !hasWorkingUrl(u); });
+            if (bad.length) {
+                downloadElem.innerHTML += "<b>Cannot export:</b> no working URL for part(s) " + bad.map(function(u){ return u.index + 1; }).join(", ") + ". Try playing through those parts first, then export again.<br>";
+                downloadState = -1;
+                return;
+            }
+            downloadElem.innerHTML += "Downloading...<br>";
+            createAndDownloadZip(urls, true).then((p)=>{});
+        }).catch(function(err){
+            downloadElem.innerHTML += "<b>Error:</b> " + err.message + "<br>";
+            downloadState = -1;
+        });
     }
 
     // Main entry point for audiobooks
     function bifFoundAudiobook(){
-        // New global style info
-        let s = document.createElement("style");
-        s.innerHTML = CSS;
-        document.head.appendChild(s)
         if (odreadCmptParams == null){
             alert("odreadCmptParams not set, so cannot resolve book urls! Please try refreshing.")
             return;
@@ -589,60 +737,900 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
            <a class="pLink" id="download"> <h1> Download EPUB </h1> </a>
         </div>
     `;
-    const pages = window.pages = {};
+    // Chapter gathering decrypts each chapter shell as it loads
+    // (capture/decrypt helpers below) instead of depending on the
+    // reader's pages index, which no longer fills on the current reader.
 
-    // Libby used the bind method as a way to "safely" expose
-    // the decryption module. THIS IS THEIR DOWNFALL.
-    // As we can hook bind, allowing us to obtain the
-    // decryption function
-    const originalBind = Function.prototype.bind;
-    Function.prototype.bind = function(...args) {
-        const boundFn = originalBind.apply(this, args);
 
-        // Store bound arguments (excluding `this`) for potential decryption function
-        boundFn.__boundArgs = args.slice(1);
+    // A chapter is ready as soon as its iframe has a src: plain chapters
+    // are already-decrypted XHTML, encrypted ones hand their payload to
+    // parent.__bif_cfc1 / __bif_cfc0 as the iframe loads (see capture).
+    function chapterUrl(c){
+        const f = c.sheetBox && c.sheetBox.querySelector("iframe");
+        return (f && f.src) ? f.src : null;
+    }
+    // Standalone payload decryption (replicates the bifocal "rumi"
+    // transform): cfc1 payloads are base64 with each 4-char group's 1st
+    // and 4th characters swapped; cfc0 payloads are plain base64.
+    function decryptPayload(edata, isCfc1){
+        return atob(isCfc1 ? edata.replace(/(.)(.)(.)(.)/g, "$4$2$3$1") : edata);
+    }
 
-        // Also store the original function for debugging
-        boundFn.__originalFunction = this;
-
-        // If this looks like a decryption function, store it globally
-        if (this.toString().includes('decryption') ||
-            args.some(arg => typeof arg === 'function' && arg.toString().includes('decryption'))) {
-            console.log("Decryption function detected:", this);
-            window.__libregrab_decryption_fn = args.find(arg => typeof arg === 'function');
+    // A chapter shell is <head> (styles) + <body><script>
+    // parent.__bif_cfc1(self,'<edata>')</script></body>; decrypting the
+    // payload yields the real <body>. Returns {html, status}. Status is one of:
+    //   "decrypted"     - payload found and decrypted into a real <body>
+    //   "unencrypted"   - no payload and no <script> in the body (cover, title, ...)
+    //   "unknown-shell" - no payload match, but the body holds a <script>
+    //                     (shell format changed, cannot decrypt it)
+    //   "decrypt-failed"- payload found but the transform threw
+    //   "bad-payload"   - payload decrypted to something that is not a <body>
+    function decryptChapterShell(shellHtml){
+        const m = shellHtml.match(/parent\.__bif_cfc1\(self,'([^']+)'\)/)
+               || shellHtml.match(/parent\.__bif_cfc0\(self,'([^']+)'\)/);
+        if (!m){
+            const hasScript = /<body[^>]*>[\s\S]*<script/i.test(shellHtml);
+            return {html: shellHtml, status: hasScript ? "unknown-shell" : "unencrypted"};
         }
+        const isCfc1 = shellHtml.includes("__bif_cfc1");
+        let decrypted;
+        try{
+            decrypted = decryptPayload(m[1], isCfc1);
+        }catch(e){
+            return {html: shellHtml, status: "decrypt-failed"};
+        }
+        if (!/^\s*<body/i.test(decrypted)){
+            return {html: shellHtml, status: "bad-payload"};
+        }
+        // Splice the decrypted <body> into the shell, keeping its <head> (styles).
+        const spliced = shellHtml.replace(/<body[^>]*>[\s\S]*<\/body>/i, ()=>decrypted);
+        return {html: spliced !== shellHtml ? spliced : shellHtml, status: "decrypted"};
+    }
 
-        return boundFn;
+
+    // Wrap parent.__bif_cfc1/__bif_cfc0 so each chapter shell's payload
+    // is decrypted and stashed as its iframe loads, instead of fetching
+    // every signed chapter URL again afterwards. Captured HTML is keyed
+    // by the chapter window's name (the spine component id); the original
+    // handler is always called through so the reader renders normally.
+    const capturedChapters = {};
+    // Plain chapters harvested from their frames during the gather
+    // pass: the reader recycles distant chapter frames as new ones
+    // load, so by build time a plain chapter's frame may be gone even
+    // though it loaded fine. Harvest while it is definitely alive.
+    const harvestedChapters = {};
+    // Stylesheet links per chapter, snapshotted at settle time for
+    // the same reason: they live in the chapter's frame document,
+    // which the reader may remove before build time.
+    const harvestedCss = {};
+    const realCfcHandlers = {};
+    function makeCfcCapture(kind){
+        const isCfc1 = kind === "__bif_cfc1";
+        return function(win, edata){
+            try {
+                const html = decryptPayload(edata, isCfc1);
+                if (win && win.name && /^\s*<body/i.test(html))
+                    capturedChapters[win.name] = html;
+            } catch(e) {
+                console.warn("LibreGRAB: chapter capture failed for " + kind, e);
+            }
+            const real = realCfcHandlers[kind];
+            if (typeof real === "function")
+                return real(win, edata);
+        };
+    }
+    function installCfcCapture(kind){
+        const wrapper = makeCfcCapture(kind);
+        if (typeof window[kind] === "function")
+            realCfcHandlers[kind] = window[kind];
+        try {
+            // A property trap, so a handler the reader defines *after*
+            // this runs is wrapped on assignment too.
+            Object.defineProperty(window, kind, {
+                configurable: true,
+                enumerable: true,
+                get(){ return wrapper; },
+                set(fn){
+                    if (typeof fn === "function" && fn !== wrapper)
+                        realCfcHandlers[kind] = fn;
+                }
+            });
+        } catch(e) {
+            window[kind] = wrapper;
+        }
+    }
+    function installChapterCapture(){
+        installCfcCapture("__bif_cfc1");
+        installCfcCapture("__bif_cfc0");
+    }
+
+    function chapterCaptureFor(c, idToIfram){
+        const iframe = idToIfram[c.id];
+        return capturedChapters[c.id] ||
+            (iframe && iframe.name ? capturedChapters[iframe.name] : undefined);
+    }
+    // A chapter is settled when its capture arrived, or its iframe has
+    // finished loading and no longer holds a shell script (a plain
+    // chapter that never calls __bif_cfc*, or a load the capture
+    // missed); those fall back to fetching in createContent.
+    // Read a chapter straight out of its already-loaded iframe instead
+    // of fetching its URL again from outside the iframe. Only for
+    // settled chapters the capture did not claim: plain chapters
+    // (covers, title pages) never call __bif_cfc*, and a rendered
+    // chapter's document no longer holds the shell script either.
+    // Returns null when the chapter is not safely readable this way.
+    function harvestLoadedChapter(c, idToIfram){
+        const iframe = idToIfram[c.id];
+        if (!iframe || !iframe.src) return null;
+        let doc;
+        try { doc = iframe.contentWindow && iframe.contentWindow.document; }
+        catch(e) { return null; }
+        if (!doc || !doc.documentElement || doc.readyState !== "complete")
+            return null;
+        if (doc.documentElement.innerHTML.includes("__bif_cfc"))
+            return null; // shell has not run yet (or capture is coming)
+        if (!doc.body || !doc.body.innerHTML.trim()) return null;
+        return doc.documentElement.outerHTML;
+    }
+    function chapterDocSettled(c, idToIfram){
+        const iframe = idToIfram[c.id];
+        if (!iframe || !iframe.src) return !iframe;
+        let doc;
+        try { doc = iframe.contentWindow && iframe.contentWindow.document; }
+        catch(e) { return true; }
+        if (!doc || !doc.documentElement) return false;
+        // An iframe whose src was assigned but which has not navigated
+        // yet still shows its initial about:blank document, which is
+        // "complete" and shell-free - that is NOT settled, the chapter
+        // has not even started loading.
+        if (!doc.URL || !doc.URL.startsWith("http")) return false;
+        return doc.readyState === "complete" &&
+            !doc.documentElement.innerHTML.includes("__bif_cfc");
+    }
+
+    // A chapter URL suitable for resolving relative asset paths
+    // against, for chapters whose content we already hold (captured or
+    // harvested) but whose frame the reader has since recycled: the
+    // signed URL if the frame survives, else the chapter's own path
+    // on this origin (asset fetches work unsigned; the token in the
+    // signed URL is not needed for base resolution).
+    function chapterBaseUrl(c, idToIfram){
+        const f = idToIfram[c.id];
+        if (f && f.src) return f.src;
+        return location.origin + "/" + c.id;
+    }
+    // Names of spine chapters that have no file entry - used as a
+    // hard completeness check before the EPUB is written, so a
+    // partially-built book can never be saved silently.
+    function missingChapterFiles(files, components){
+        const names = new Set(files.map(f => f.name));
+        return components
+            .map(c => "OEBPS/" + truncate(c.id))
+            .filter(n => !names.has(n));
+    }
+
+    // Load chapters one at a time, in spine order, waiting for each to
+    // settle (captured, or its document finished loading shell-free)
+    // before starting the next: a burst no human reader produces, and
+    // one by one keeps the capture race-free. A chapter that does not
+    // settle within the timeout is left for the fallback fetch rather
+    // than stalling the download.
+    // OverDrive's background pagination pass never runs while a download
+    // is in progress, so gather by navigation instead: open the ToC,
+    // click each entry in order (each forces its frame to load in ~1s),
+    // harvest the frame it loads, then jump back to the chapter the
+    // download started on. Libby keeps the _loadContent + capture path
+    // (its chapters are encrypted shells, not plain docs).
+    // Reader ToC helpers (hoisted: used by waitForChapters).
+    // Pure DOM helpers; visibleIndex stays inside
+    // waitForChapters (it needs the local components list).
+    const panelOpen = () => {
+        try { return (document.body.innerText || '').toLowerCase().indexOf('search within book') >= 0; }
+        catch(e) { return false; }
     };
-
-
+    const menuBtn = () => {
+        try {
+            return [...document.querySelectorAll('button, [role="button"]')].find(b => /\bMENU\b/i.test((b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '')));
+        } catch(e) { return undefined; }
+    };
+    const titleLine = () => {
+        try {
+            const el = document.querySelector('.chapter-bar-title-button') || [...document.querySelectorAll('[class*="chapter-bar-title"]')][0];
+            if (!el) return '';
+            return (el.innerText || '').trim().split('\n')[0].trim();
+        } catch(e) { return ''; }
+    };
+    const tocEntries = () => {
+        try {
+            const out = [];
+            const seen = new Set();
+            for (const li of document.querySelectorAll('li')) {
+                if (!/Page \d+/.test(li.innerText || '')) continue;
+                const btn = li.querySelector('button');
+                const t = btn ? (btn.innerText || '').trim() : (li.innerText || '').trim().split('\n')[0].trim();
+                if (!t || seen.has(t)) continue;
+                seen.add(t);
+                out.push(t);
+            }
+            return out;
+        } catch(e) { return []; }
+    };
+    // Wait until the ToC entry list stops growing (two
+    // consecutive polls with the same count), up to 90s.
+    // Entries populate progressively after the page-counting
+    // pass; returning on the first entry gives a partial list,
+    // and a later entry missing from it gets skipped by the
+    // loop. Returns whatever is there after the timeout.
+    const stableEntries = async () => {
+        let last = -1, stable = 0;
+        for (let i = 0; i < 45; i++) {
+            await new Promise(r => setTimeout(r, 2000));
+            const e = tocEntries();
+            if (e.length > 0 && e.length === last) {
+                stable++;
+                if (stable >= 2) return e;
+            } else {
+                stable = 0;
+                last = e.length;
+            }
+        }
+        return tocEntries();
+    };
+    const openToc = async () => {
+        // If the ToC list is already showing, just wait for it to
+        // settle. (Do NOT return early merely because the menu sheet
+        // is open: it may be on the main menu, with no list at all,
+        // and polling then waits for entries that will never appear.)
+        if (tocEntries().length > 0) return stableEntries();
+        if (!panelOpen()) {
+            const btn = menuBtn();
+            if (btn) btn.click();
+            await new Promise(r => setTimeout(r, 1200));
+        }
+        const leaves = [...document.querySelectorAll('*')].filter(el => el.children.length === 0 && (el.textContent || '').trim().toLowerCase() === 'table of contents');
+        const vis = leaves.filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+        if (vis.length) {
+            let deepest = vis[0], depth = -1;
+            for (const el of vis) {
+                let d = 0, p = el;
+                while (p.parentElement) { d++; p = p.parentElement; }
+                if (d > depth) { depth = d; deepest = el; }
+            }
+            // The leaf can sit below the viewport (y > 839 on this
+            // reader), where the click does not open the list.
+            // Scroll it into view first.
+            try { deepest.scrollIntoView({block: 'center'}); } catch(_) {}
+            await new Promise(r => setTimeout(r, 400));
+            deepest.click();
+        }
+        return stableEntries();
+    };
+    const clickEntry = (title) => {
+        try {
+            const words = title.toLowerCase();
+            const pick = (cands) => {
+                if (!cands.length) return null;
+                let deepest = cands[0], depth = -1;
+                for (const el of cands) {
+                    let d = 0, p = el;
+                    while (p.parentElement) { d++; p = p.parentElement; }
+                    if (d > depth) { depth = d; deepest = el; }
+                }
+                return deepest;
+            };
+            const all = [...document.querySelectorAll('button, a, li')].filter(el => {
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            });
+            // Exact match first: the title button's text IS
+            // the title. Contains-match is the fallback for
+            // short titles that are substrings of others.
+            let target = pick(all.filter(el => (el.innerText || '').trim().toLowerCase() === words));
+            if (!target) target = pick(all.filter(el => (el.innerText || '').trim().toLowerCase().indexOf(words) >= 0));
+            if (!target) return false;
+            target.click();
+            return true;
+        } catch(e) { return false; }
+    };
     async function waitForChapters(callback){
         let components = getBookComponents();
-        // Force all the chapters to load in.
-        components.forEach(page =>{
-            if (undefined != window.pages[page.id]) return;
-            page._loadContent({callback: ()=>{}})
-        });
-        // But its not instant, so we need to wait until they are all set (see: bifFound())
-        while (components.filter((page)=>undefined==window.pages[page.id]).length){
-            await new Promise(r => setTimeout(r, 100));
+        if (/read\.overdrive\.com$/i.test(location.hostname)){
+            // OverDrive gathers by navigation, not by waiting for the
+            // reader's background pagination pass (it never runs while
+            // a download is in progress). openToc opens the table of
+            // contents, scrolls its entry into view, and waits for the
+            // entry list to stop growing; each entry is clicked in
+            // order, with one retry, which forces its frame to load.
+            // After the ToC loop, components still missing are walked
+            // with the reader's Next/Previous Chapter controls, and
+            // the walk sweeps after every step even when the arrival
+            // could not be confirmed (a component may load without
+            // registering a visible index). A chapter that still has
+            // no frame is fetched in createContent from its signed
+            // URL (spine path + per-component token, as the audiobook
+            // path builds it) instead of skipped. The ToC loop gets
+            // its own 10-min budget inside the 15-min gather budget,
+            // so a slow ToC cannot starve the walk; an empty ToC
+            // falls through to the walk instead of aborting.
+            const visibleIndex = () => {
+                try {
+                    let best = -1, bestX = 1e9;
+                    components.forEach((c, i) => {
+                        const f = c.sheetBox && c.sheetBox.querySelector('iframe');
+                        if (!f || !f.src) return;
+                        const r = f.getBoundingClientRect();
+                        if (r.width > 0 && Math.abs(r.x) < Math.abs(bestX)) { bestX = r.x; best = i; }
+                    });
+                    return best;
+                } catch(e) { return -1; }
+            };
+            const sweepSettled = (done) => {
+                for (let page of components) {
+                    if (done.has(page.id)) continue;
+                    const f = page.sheetBox && page.sheetBox.querySelector('iframe');
+                    if (!f || !f.src) continue;
+                    const one = {}; one[page.id] = f;
+                    if (chapterCaptureFor(page, one)) { done.add(page.id); callback(); continue; }
+                    if (chapterDocSettled(page, one)) {
+                        try {
+                            const fdoc = f.contentWindow && f.contentWindow.document;
+                            if (fdoc) {
+                                const links = Array.from(fdoc.querySelectorAll('link')).map(l => l.href).filter(Boolean);
+                                if (links.length) harvestedCss[page.id] = links;
+                            }
+                        } catch(e) { /* frame already gone */ }
+                        if (!harvestedChapters[page.id]) {
+                            const h = harvestLoadedChapter(page, one);
+                            if (h) { harvestedChapters[page.id] = h; done.add(page.id); callback(); }
+                        }
+                    }
+                }
+            };
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            // Humanlike pacing: a reader pauses between actions and
+            // the pause varies, so navigation does not read as a
+            // machine-gun burst of identical steps. humanStep is the
+            // pause after a small move (a slider step); humanSettle
+            // is the longer pause after a bigger jump (a chapter
+            // change, the slider to an end, closing a sheet).
+            // These average about the same as the fixed sleeps they
+            // replace, so pacing is roughly budget-neutral.
+            const humanSleep = (minMs, maxMs) => {
+                const lo = Math.min(minMs, maxMs), hi = Math.max(minMs, maxMs);
+                return sleep(lo + Math.random() * (hi - lo));
+            };
+            const humanStep = () => humanSleep(800, 2500);
+            const humanSettle = () => humanSleep(1500, 3200);
+            const startTitle = titleLine();
+            const startIndex = visibleIndex();
+            const done = new Set();
+            // Two budgets: the ToC loop gets 10 min, the whole gather
+            // (loop + leftover walk + jump-back) gets 15 min, so a
+            // slow ToC cannot starve the walk.
+            const deadline = Date.now() + 900000;
+            const tocDeadline = Date.now() + 600000;
+            sweepSettled(done);
+            // Go to one ToC entry (open the sheet, click it, wait for
+            // the title), retrying once before giving up on it. A
+            // single failed click must not silently skip the chapter.
+            const gotoEntry = async (title) => {
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    entries = await openToc();
+                    if (!entries.length) return false;
+                    if (!clickEntry(title)) continue;
+                    const t0 = Date.now();
+                    while (Date.now() - t0 < 12000) {
+                        if (titleLine() === title) return true;
+                        await sleep(500);
+                    }
+                }
+                return false;
+            };
+            // Step the reader to a component index with its own Next /
+            // Previous Chapter controls (no ToC needed). dl overrides
+            // the gather deadline: the positioning pass runs on its
+            // own budget, so it passes its deadline in here instead
+            // of being cut off by the 15-min gather deadline.
+            const gotoIndex = async (targetIdx, dl) => {
+                const limit = (typeof dl === 'number' && dl > 0) ? dl : deadline;
+                // Direction of travel from where the reader starts.
+                const startCur = visibleIndex();
+                const forward = startCur < 0 ? true : startCur < targetIdx;
+                for (let step = 0; step < 30; step++) {
+                    if (Date.now() > limit) return false;
+                    const cur = visibleIndex();
+                    if (cur === targetIdx) return true;
+                    if (cur < 0) { await sleep(1000); continue; }
+                    // Overshoot: the reader skipped past the target.
+                    // Its Next / Previous Chapter controls do not stop
+                    // at every spine component, a footnote block is
+                    // skipped as a group (one Next click from the last
+                    // real chapter jumps the visible index past all of
+                    // them). Do not keep stepping and oscillating; the
+                    // frames the reader just loaded are swept by the
+                    // caller, which is how the group gets gathered.
+                    if (forward && cur > targetIdx) return false;
+                    if (!forward && cur < targetIdx) return false;
+                    const btn = [...document.querySelectorAll('button, a, [role="button"]')].find(el => {
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).trim();
+                        return cur < targetIdx ? /next chapter/i.test(label) : /previous chapter/i.test(label);
+                    });
+                    if (!btn) return false;
+                    btn.click();
+                    const t0 = Date.now();
+                    while (Date.now() - t0 < 5000) {
+                        if (visibleIndex() === targetIdx) return true;
+                        await sleep(500);
+                    }
+                }
+                return visibleIndex() === targetIdx;
+            };
+            let entries = await openToc();
+            if (!entries.length) {
+                // Cold page: the counting pass had not filled the ToC
+                // yet. Do NOT abort; the walk below reaches the
+                // chapters with Next/Previous, and the fetch fallback
+                // in createContent covers any that still has no frame.
+                downloadElem.innerHTML += 'WARNING: table of contents empty; walking chapters with Next/Previous instead.<br>';
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            }
+            // Visible index at the first and last ToC entries: the
+            // bounds of the chaptered body, used by the positioning
+            // pass below to tell front matter from back matter.
+            // Skip the Cover (idx 0) for the first bound: the ToC
+            // lists it as an entry, but it is front matter, not
+            // the start of the chaptered body. If it became
+            // firstTocIdx, no component could be "before the first
+            // ToC chapter" and the front matter would be
+            // misclassified as middle (last run: col1 front=false,
+            // so it got the chapter-button walk, which can never
+            // land on it).
+            let firstTocIdx = -1, lastTocIdx = -1;
+            for (const title of entries) {
+                if (Date.now() > tocDeadline) break;
+                if (await gotoEntry(title)) {
+                    const vi = visibleIndex();
+                    if (vi >= 0) {
+                        if (vi > 0 && firstTocIdx < 0) firstTocIdx = vi;
+                        lastTocIdx = vi;
+                    }
+                }
+                sweepSettled(done);
+                if (done.size >= components.length) break;
+            }
+            sweepSettled(done);
+            // Components the ToC walk never reached (no ToC entry, or
+            // a missed entry): walk them with the reader's own Next /
+            // Previous Chapter controls so each gets a loaded frame.
+            // The reader only keeps ~3 frames alive, so a chapter
+            // outside the window at the final position has no content
+            // and no signed URL without this.
+            const missingIdx = [];
+            components.forEach((c, i) => { if (!done.has(c.id)) missingIdx.push(i); });
+            if (missingIdx.length) {
+                downloadElem.innerHTML += `Walking ${missingIdx.length} missed chapter(s) with Next/Previous Chapter<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                for (const idx of missingIdx) {
+                    if (Date.now() > deadline) break;
+                    // Already gathered as part of a group (e.g. the
+                    // footnote block, swept together after one
+                    // overshoot); do not walk it again.
+                    if (done.has(components[idx].id)) continue;
+                    await gotoIndex(idx);
+                    // Sweep even if gotoIndex could not confirm the
+                    // arrival: the last component (e.g. next-reads)
+                    // may not register a visible index, yet its frame
+                    // can still be loaded and harvestable. Give it a
+                    // moment to settle first (humanlike pause).
+                    await humanSettle();
+                    sweepSettled(done);
+                    if (done.size >= components.length) break;
+                }
+                sweepSettled(done);
+            }
+            // Positioning pass for components still missing after
+            // the ToC loop and the chapter walk. Two shapes need
+            // dedicated positioning because the reader's chapter
+            // jumps skip them, so neither the ToC loop nor the walk
+            // ever loads their frames. A front-matter component
+            // (before the first ToC chapter) only loads when the
+            // reader sits on or just past it: one Next Chapter
+            // click from the Cover lands just past the gap with its
+            // frame alive in the ~3-frame window (the jump lands on
+            // idx 4, alive [3,4,5], which covers idx 3 but not idx
+            // 2), and the reader's own "Next Page" button in the
+            // main menu steps one page at a time from the Cover,
+            // landing on idx 1, 2, 3 in turn to catch an earlier
+            // gap the jump overshoots. A
+            // back-matter component (after the last ToC chapter)
+            // only loads when the reader sits at the end: the End
+            // Of Book button lands there and preloads the
+            // neighbour. The page slider is NOT the mechanism: it
+            // does not move this reader in response to
+            // programmatic value sets (verified repeatedly), so
+            // slider sets are only a logged last-resort fallback.
+            // Position, sweep, re-check; never leave a component
+            // to the strict completeness check unvisited. No
+            // exclusions.
+            const stillLeft = () => {
+                const out = [];
+                components.forEach((c, i) => { if (!done.has(c.id)) out.push(i); });
+                return out;
+            };
+            const left = stillLeft();
+            if (left.length) {
+                // Positioning gets its own budget, set when the
+                // pass begins. The ToC loop and the chapter walk can
+                // consume the whole 15-min gather deadline and
+                // starve positioning (an earlier run left ~60s for
+                // a ~2-min positioning pass). Six minutes from the
+                // pass start covers the Next Page steps and the End Of
+                // Book retries at a human pace; the pass still
+                // cannot hang the run, because this budget bounds
+                // it.
+                const posDeadline = Date.now() + 360000;
+                const posT0 = Date.now();
+                // Positioning log: every action (slider set, button
+                // click, sweep result, early exit) goes to the panel
+                // and the console, so a silent no-op is visible.
+                const plog = (msg) => {
+                    const line = `[Positioning] ${msg}`;
+                    try { console.log(`[LibreGRAB] ${line}`); } catch(e) {}
+                    try {
+                        downloadElem.innerHTML += `${line}<br>`;
+                        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                    } catch(e) {}
+                };
+                plog(`starting, ${left.length} still missed (${left.map(i => components[i].id).join(', ')}); budget ${Math.round((posDeadline - posT0) / 1000)}s; visible idx ${visibleIndex()}; gathered ${done.size}/${components.length}`);
+                downloadElem.innerHTML += `Positioning for ${left.length} still-missed chapter(s)<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                // Make sure the chapter bar (slider, chapter
+                // buttons) is reachable: close the ToC/menu sheet
+                // if it is still open.
+                if (panelOpen()) {
+                    const mb = menuBtn();
+                    if (mb) { mb.click(); await humanSleep(900, 1800); }
+                }
+                // Page slider (input[type=range]): the reader's
+                // page control. It does NOT move this reader in
+                // response to programmatic value sets: the native
+                // setter + input/change/InputEvent change the
+                // displayed value but the reader stays put
+                // (verified repeatedly). So never rely on a slider
+                // set for navigation; it is only a logged
+                // last-resort fallback. Read min/max/value from the
+                // DOM for logging; never hardcode page numbers.
+                const sliderEl = () => {
+                    try { return document.querySelector('input[type=range]'); } catch(e) { return null; }
+                };
+                const setSlider = (val) => {
+                    const s = sliderEl();
+                    if (!s) return false;
+                    try {
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(s, String(val));
+                        s.dispatchEvent(new Event('input', {bubbles: true}));
+                        s.dispatchEvent(new Event('change', {bubbles: true}));
+                        return true;
+                    } catch(e) { return false; }
+                };
+                const sliderMax = () => { const s = sliderEl(); return s ? (parseInt(s.max, 10) || parseInt(s.getAttribute('max') || '0', 10) || 0) : 0; };
+                const sliderMin = () => { const s = sliderEl(); return s ? (parseInt(s.min, 10) || parseInt(s.getAttribute('min') || '1', 10) || 1) : 1; };
+                const sliderVal = () => { const s = sliderEl(); return s ? (parseInt(s.value, 10) || 0) : 0; };
+                // Is the target component's frame loaded right now?
+                const targetAlive = (idx) => {
+                    const f = components[idx].sheetBox && components[idx].sheetBox.querySelector('iframe');
+                    return !!(f && f.src);
+                };
+                // Slider set with logging. The slider's own value
+                // updates synchronously with the setter, so it is
+                // logged here; the reader's navigation (and the
+                // visible index) lags behind it, so the index and
+                // the target's alive state are logged by posState
+                // after the settle pause + sweep. A set that does
+                // nothing is visible here.
+                const posSetSlider = (val, why, idx) => {
+                    const ok = setSlider(val);
+                    plog(`slider ${why}: set ${val} -> ${ok ? 'ok' : 'FAILED (no slider or setter threw)'}; value now ${sliderVal()}`);
+                    return ok;
+                };
+                // State after a settle pause + sweep: visible index,
+                // slider value, whether the target's frame is alive
+                // and whether it is gathered.
+                const posState = (what, idx) => {
+                    plog(`${what}: visible idx ${visibleIndex()}, slider value ${sliderVal()}, target ${components[idx].id} alive: ${targetAlive(idx)}, gathered=${done.has(components[idx].id)}, total ${done.size}/${components.length}`);
+                };
+                const navBtn = (re) => [...document.querySelectorAll('button, a, [role="button"]')].find(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).trim();
+                    return re.test(label);
+                });
+                for (const idx of left) {
+                    if (Date.now() > posDeadline) { plog(`budget exhausted (${Math.round((Date.now() - posT0) / 1000)}s used), stopping positioning`); break; }
+                    if (done.has(components[idx].id)) continue;
+                    // Front matter = before the first ToC chapter;
+                    // back matter = after the last ToC chapter.
+                    // Without ToC bounds, fall back to the reader's
+                    // current position.
+                    const curIdx = visibleIndex();
+                    const isFront = firstTocIdx >= 0 ? idx < firstTocIdx : (curIdx >= 0 ? idx < curIdx : idx * 2 < components.length);
+                    const isBack = lastTocIdx >= 0 ? idx > lastTocIdx : (curIdx >= 0 ? idx > curIdx : idx * 2 >= components.length);
+                    plog(`component ${components[idx].id} (spine ${idx}): front=${isFront} back=${isBack}, visible idx=${curIdx}, gathered ${done.size}/${components.length}`);
+                    if (isFront) {
+                        // Go to the Cover with the chapter buttons,
+                        // then one Next Chapter click lands just
+                        // past the gap; sweep there. One more Next
+                        // step if the gap is wider. The slider set
+                        // to its min must NOT be the way to the
+                        // Cover: it does not move this reader, and
+                        // it returns "ok" (the displayed value
+                        // changes), so a fallback guarded on its
+                        // failure never runs; the Next Chapter
+                        // clicks would then step the reader from
+                        // wherever it actually is, not from the
+                        // Cover.
+                        await gotoIndex(0, posDeadline);
+                        plog('at Cover (chapter buttons)');
+                        await humanSettle();
+                        sweepSettled(done);
+                        posState('at Cover', idx);
+                        for (let attempt = 0; attempt < 2 && !done.has(components[idx].id) && Date.now() < posDeadline; attempt++) {
+                            const nb = navBtn(/next chapter/i);
+                            if (!nb) { plog('no Next Chapter button found'); break; }
+                            // A reader finds the button before
+                            // pressing it: a short variable pause
+                            // before the click.
+                            await humanSleep(300, 1000);
+                            nb.click();
+                            plog(`Next Chapter click (attempt ${attempt + 1})`);
+                            await humanSettle();
+                            sweepSettled(done);
+                            posState('after Next Chapter', idx);
+                        }
+                        if (!done.has(components[idx].id)) {
+                            // The chapter jump from the Cover lands
+                            // just past the gap (e.g. idx 4, alive
+                            // [3,4,5]), which covers the last
+                            // front-matter component but not an
+                            // earlier one (e.g. idx 2, which needs
+                            // the visible index to be 1, 2, or 3 to
+                            // load). The slider walk that used to
+                            // cover it does not work: the slider
+                            // does not move this reader in response
+                            // to programmatic value sets (verified
+                            // repeatedly), so a slider walk is a
+                            // silent no-op. Round trips through the
+                            // front matter with the chapter buttons
+                            // do not work either: the jump passes
+                            // through the gap without ever settling
+                            // in it (verified: three round trips,
+                            // col1 never alive). The mechanism that
+                            // does work is the reader's own "Next
+                            // Page" button in the main menu: one
+                            // click steps exactly one page (slider
+                            // +2 per click), so stepping from the
+                            // Cover lands on idx 1, 2, 3 in turn
+                            // and loads the gap component's frame.
+                            // The "Next Page" item is a list row;
+                            // clicking the row itself does nothing
+                            // -- the real control is the nested
+                            // button inside it. A plain DOM .click()
+                            // on that button is enough. Sweep after
+                            // every click; the frame is alive as
+                            // soon as the reader sits on it.
+                            // Return to the Cover first: the Next
+                            // Chapter attempts above left the reader
+                            // at idx 4, and the steps must start
+                            // from the Cover to land on 1, 2, 3.
+                            await gotoIndex(0, posDeadline);
+                            await humanSettle();
+                            sweepSettled(done);
+                            posState('back at Cover for Next Page', idx);
+                            plog(`front-matter Next Page steps for ${components[idx].id} (spine ${idx})`);
+                            if (!done.has(components[idx].id)) {
+                                // The nested button inside the
+                                // "Next Page" list row. The row's
+                                // label starts with "Next Page"; the
+                                // button inside it carries only the
+                                // arrow, so match the row and click
+                                // the button.
+                                const nextPageBtn = () => {
+                                    const rows = [...document.querySelectorAll('li, [role="menuitem"], [role="option"], button, a, [role="button"]')].filter(el => {
+                                        const r = el.getBoundingClientRect();
+                                        if (r.width === 0 || r.height === 0) return false;
+                                        const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.textContent || '')).trim().replace(/\s+/g, ' ');
+                                        return /^next page/i.test(label);
+                                    });
+                                    if (!rows.length) return null;
+                                    const row = rows[0];
+                                    const inner = row.querySelector ? row.querySelector('button, a, [role="button"]') : null;
+                                    if (inner) return inner;
+                                    return (row.tagName === 'BUTTON' || row.tagName === 'A') ? row : null;
+                                };
+                                // Open the main menu: the sheet stays
+                                // open across clicks, so one open
+                                // covers all the steps. After a ToC
+                                // click the sheet can be showing the
+                                // ToC list instead, with no "Next
+                                // Page" visible; clicking MENU again
+                                // switches it back to the main menu.
+                                const openMainMenu = async () => {
+                                    for (let attempt = 0; attempt < 2; attempt++) {
+                                        if (nextPageBtn()) return true;
+                                        const mb = menuBtn();
+                                        if (!mb) { plog('Next Page steps: no MENU button'); return false; }
+                                        await humanSleep(300, 900);
+                                        mb.click();
+                                        await humanSleep(900, 1800);
+                                        if (nextPageBtn()) return true;
+                                    }
+                                    return !!nextPageBtn();
+                                };
+                                if (await openMainMenu()) {
+                                    for (let step = 0; step < 4 && !done.has(components[idx].id) && Date.now() < posDeadline; step++) {
+                                        const nb = nextPageBtn();
+                                        if (!nb) { plog('Next Page steps: button gone'); break; }
+                                        await humanSleep(300, 1000);
+                                        nb.click();
+                                        plog(`Next Page click (step ${step + 1})`);
+                                        await humanSettle();
+                                        sweepSettled(done);
+                                        posState(`after Next Page ${step + 1}`, idx);
+                                    }
+                                    if (Date.now() > posDeadline) plog('front-matter Next Page steps: positioning budget exhausted');
+                                    sweepSettled(done);
+                                } else {
+                                    plog('Next Page steps: main menu / button not found');
+                                }
+                            }
+                        }
+                    }
+                    if (!done.has(components[idx].id) && isBack) {
+                        // The page slider does NOT move this reader
+                        // in response to programmatic value sets
+                        // (native setter + input/change/InputEvent,
+                        // verified repeatedly: the displayed value
+                        // changes but the reader stays put). So the
+                        // slider-to-max + step-down is a silent
+                        // no-op and must not be the mechanism. The
+                        // "End Of Book" button (DOM .click()) does
+                        // move it: it lands on the last component
+                        // and preloads the neighbour, so a sweep
+                        // right after the click harvests the
+                        // missing back-matter component. Retry once
+                        // in case the preload is timing-dependent.
+                        // Its label carries the remaining page
+                        // count, so match on the text, not the
+                        // number.
+                        for (let attempt = 0; attempt < 2 && !done.has(components[idx].id) && Date.now() < posDeadline; attempt++) {
+                            const eb = navBtn(/end of book/i);
+                            if (!eb) { plog('no End Of Book button found'); break; }
+                            await humanSleep(300, 1000);
+                            eb.click();
+                            plog(`End Of Book click (attempt ${attempt + 1})`);
+                            await humanSettle();
+                            sweepSettled(done);
+                            posState('after End Of Book', idx);
+                        }
+                        if (!done.has(components[idx].id)) {
+                            // Last resort: the slider set. It does
+                            // not navigate this reader, but it is
+                            // harmless and may work on another book
+                            // or reader where the slider does
+                            // respond; log the outcome either way.
+                            if (posSetSlider(sliderMax(), 'to end (fallback)', idx)) {
+                                await humanSettle();
+                                sweepSettled(done);
+                                posState('after slider-to-end fallback', idx);
+                            } else plog('slider fallback unavailable');
+                        }
+                        if (Date.now() > posDeadline) plog('back matter: positioning budget exhausted');
+                        sweepSettled(done);
+                    }
+                    if (!done.has(components[idx].id) && !isFront && !isBack) {
+                        // Middle component the chapter walk missed:
+                        // retry the walk once.
+                        plog(`middle retry: walking to spine ${idx}`);
+                        await gotoIndex(idx, posDeadline);
+                        await humanSettle();
+                        sweepSettled(done);
+                        posState('middle retry', idx);
+                    }
+                    if (done.size >= components.length) break;
+                }
+                sweepSettled(done);
+                plog(`pass done in ${Math.round((Date.now() - posT0) / 1000)}s; gathered ${done.size}/${components.length}; still missed: ${stillLeft().map(i => components[i].id).join(', ') || 'none'}`);
+            }
+            // Jump back to the chapter the download started on.
+            const backTitle = entries.find(t => t === startTitle) || entries.find(t => t.toLowerCase().indexOf(startTitle.toLowerCase().slice(0, 20)) >= 0) || entries[0];
+            if (backTitle) {
+                await openToc();
+                if (clickEntry(backTitle)) {
+                    const t0 = Date.now();
+                    while (Date.now() - t0 < 12000) {
+                        if (titleLine() === backTitle) break;
+                        await sleep(500);
+                    }
+                }
+            } else if (startIndex >= 0) {
+                await gotoIndex(startIndex);
+            }
+            if (panelOpen()) {
+                const btn = menuBtn();
+                if (btn) btn.click();
+            }
+            return;
+        }
+        for (let page of components){
+            const frameOf = () => page.sheetBox && page.sheetBox.querySelector("iframe");
+            if (!chapterUrl(page))
+                page._loadContent({callback: ()=>{}});
+            const deadline = Date.now() + 15000;
+            let retried = false;
+            while (Date.now() < deadline){
+                const f = frameOf();
+                if (f){
+                    const one = {}; one[page.id] = f;
+                    if (chapterCaptureFor(page, one) || chapterDocSettled(page, one))
+                        break;
+                    // src set but the frame never navigated (still
+                    // about:blank) - ask the reader to load it again.
+                    if (!retried && Date.now() > deadline - 12000){
+                        retried = true;
+                        page._loadContent({callback: ()=>{}});
+                    }
+                }
+                await new Promise(r => setTimeout(r, 200));
+            }
+            // If the reader has already recycled nothing yet, this is
+            // the moment this chapter's frame is guaranteed alive:
+            // harvest plain chapters now (encrypted ones are captured).
+            const fNow = frameOf();
+            if (fNow){
+                const one = {}; one[page.id] = fNow;
+                try {
+                    const fdoc = fNow.contentWindow && fNow.contentWindow.document;
+                    if (fdoc){
+                        const links = Array.from(fdoc.querySelectorAll("link"))
+                            .map(l => l.href).filter(Boolean);
+                        if (links.length) harvestedCss[page.id] = links;
+                    }
+                } catch(e) { /* frame already gone; cssRegistry may miss it */ }
+                if (!chapterCaptureFor(page, one) && !harvestedChapters[page.id]){
+                    const h = harvestLoadedChapter(page, one);
+                    if (h) harvestedChapters[page.id] = h;
+                }
+            }
             callback();
-            console.log(components.filter((page)=>undefined==window.pages[page.id]).length);
         }
     }
     function getBookComponents(){
         return BIF.objects.reader._.context.spine._.components.filter(p => "hidden" != (p.block || {}).behavior)
+            // Skip the "next-reads" recommendations page: the reader
+            // never loads it (no table-of-contents entry, no Next
+            // Chapter after the last real chapter, no iframe, and no
+            // signed URL token), so it can never be gathered. It is
+            // publisher boilerplate, not book content.
+            .filter(p => truncate(p.id) !== "next-reads.xhtml")
+            // Skip footnote components (Footnote_1, Footnote_2, ...):
+            // the reader does not treat them as navigable chapters.
+            // Its Next / Previous Chapter controls skip the whole
+            // footnote block as a group (one Next click from the last
+            // real chapter jumps the visible index past all of them),
+            // and it only keeps ~3 frames alive, so the block can
+            // never be harvested in full. They cannot be fetched
+            // either: OverDrive no longer sends the per-component
+            // signed-URL token (-odread-cmpt-params, issue #82), and
+            // an unsigned fetch of the chapter path returns 403.
+            // Known limitation: the EPUB omits the endnotes. The main
+            // text is complete without them.
+            .filter(p => !/Footnote_\d+\.xhtml$/.test(truncate(p.id)))
     }
     function truncate(path){
         return path.substring(path.lastIndexOf('/') + 1);
-    }
-    function goOneLevelUp(url) {
-        let u = new URL(url);
-        if (u.pathname === "/") return url; // Already at root
-
-
-        u.pathname = u.pathname.replace(/\/[^/]*\/?$/, "/");
-        return u.toString();
     }
     function getFilenameFromURL(url) {
         const parsedUrl = new URL(url);
@@ -658,10 +1646,10 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.innerHTML += `Gathering chapters <span id="chapAcc"> 0/${totComp} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
-        let gc = 0;
+        let gatheredCount = 0;
         await waitForChapters(()=>{
-            gc+=1;
-            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${components.filter((page)=>undefined!=window.pages[page.id]).length}/${totComp}`;
+            gatheredCount += 1;
+            downloadElem.querySelector("span#chapAcc").innerHTML = ` ${gatheredCount}/${totComp}`;
         });
 
         downloadElem.innerHTML += `Chapter gathering complete<br>`
@@ -670,13 +1658,19 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         let idToIfram = {};
         let idToMetaId = {};
         components.forEach(c=>{
-            // Nothing that can be done here...
+            // XML ids (OPF/NCX) may not start with a digit; prefix those.
+            const rawMetaId = c.meta.id || crypto.randomUUID();
+            c.meta.id = (/^[a-zA-Z_]/.test(rawMetaId) ? "" : "chap-") + rawMetaId;
+            idToMetaId[c.id] = c.meta.id;
+
             if (c.sheetBox.querySelector("iframe") == null){
-                console.warn("!!!" + window.pages[c.id]);
+                // The reader recycled this chapter's frame after it
+                // loaded. Content survives via capture/harvest, and so
+                // do the stylesheet links snapshotted at settle time.
+                if (harvestedCss[c.id]) cssRegistry[c.id] = harvestedCss[c.id].slice();
+                else console.warn("No iframe for chapter " + c.id);
                 return;
             }
-            c.meta.id = c.meta.id || crypto.randomUUID()
-            idToMetaId[c.id] = c.meta.id;
             idToIfram[c.id] = c.sheetBox.querySelector("iframe");
 
             c.sheetBox.querySelector("iframe").contentWindow.document.querySelectorAll("link").forEach(link=>{
@@ -685,25 +1679,118 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
                 if (imgAssests.includes(link.href)) return;
                 imgAssests.push(link.href);
-
-
             });
         });
-        let url = location.origin;
-        for (let i of Object.keys(window.pages)){
-            if (idToIfram[i])
-                url = idToIfram[i].src;
-            files.push({
-                name: "OEBPS/" + truncate(i),
-                input: fixXhtml(idToMetaId[i], url, window.pages[i], imgAssests, cssRegistry[i] || [])
-            });
+        // Chapters were captured and decrypted as their iframes loaded
+        // (see installChapterCapture), so most need no network request
+        // at all. Only chapters the capture missed are fetched from
+        // their signed iframe URL, then decrypted client-side (see
+        // decryptChapterShell). The capture fires when a chapter's
+        // shell script runs, which lags the forced loads, so wait
+        // until every component is settled before building.
+        const settleDeadline = Date.now() + 120000;
+        while (Date.now() < settleDeadline){
+            const pending = components.filter(c =>
+                !chapterCaptureFor(c, idToIfram) && !chapterDocSettled(c, idToIfram));
+            if (!pending.length) break;
+            const acc0 = downloadElem.querySelector("span#chapAcc");
+            if (acc0) acc0.innerHTML = ` ${totComp - pending.length}/${totComp}`;
+            await new Promise(r => setTimeout(r, 250));
         }
+
+        const capturedById = {};
+        components.forEach(c=>{
+            const html = chapterCaptureFor(c, idToIfram);
+            if (html) capturedById[c.id] = html;
+        });
+        const capturedCount = Object.keys(capturedById).length;
+        console.log(`LibreGRAB: captured ${capturedCount}/${totComp} chapters during load`);
+        downloadElem.innerHTML += `Captured ${capturedCount}/${totComp} chapters as they loaded<br>`;
+        downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+        let processed = 0;
+        let harvested = 0;
+        let refetched = 0;
+        for (let c of components){
+            // Content first: captured and harvested chapters are used
+            // even when the reader has recycled their frame (no signed
+            // URL survives then, which used to skip them silently).
+            let chapterHtml = capturedById[c.id] || harvestedChapters[c.id];
+            if (chapterHtml && harvestedChapters[c.id] && !capturedById[c.id])
+                harvested += 1;
+            if (!chapterHtml){
+                chapterHtml = harvestLoadedChapter(c, idToIfram);
+                if (chapterHtml) harvested += 1;
+            }
+            let signedSrc = (idToIfram[c.id] && idToIfram[c.id].src) || chapterUrl(c);
+            if (!signedSrc) {
+                // No loaded frame: build the signed URL the same way
+                // the audiobook path does (spine path + the
+                // per-component token captured from the reader), so a
+                // chapter the reader never loaded can still be fetched
+                // instead of skipped. Only the missing chapters use
+                // this, never a burst fetch of the whole book.
+                const tok = (odreadCmptParams || [])[c.meta && c.meta["-odread-spine-position"]];
+                if (tok && c.meta && c.meta.path) signedSrc = location.origin + "/" + c.meta.path + "?" + tok;
+            }
+            const src = signedSrc || chapterBaseUrl(c, idToIfram);
+            if (!chapterHtml && !signedSrc){
+                const msg = "No chapter content or URL for " + c.id + ", skipping";
+                console.warn(msg);
+                downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                continue;
+            }
+            if (!chapterHtml){
+                refetched += 1;
+                let res;
+                try {
+                    res = await fetch(signedSrc, {credentials: "include"});
+                } catch(e) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id}: ${e}<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                    continue;
+                }
+                if (!res.ok) {
+                    downloadElem.innerHTML += `<b>WARNING:</b> Could not fetch chapter ${c.id} (HTTP ${res.status})<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                    continue;
+                }
+                const chapter = decryptChapterShell(await res.text());
+                if (chapter.status !== "decrypted" && chapter.status !== "unencrypted"){
+                    const msg = "Chapter " + c.id + ": shell kept as-is (" + chapter.status +
+                        ") - page will be empty";
+                    console.warn(msg);
+                    downloadElem.innerHTML += `<b>WARNING:</b> ${msg}<br>`;
+                    downloadElem.scrollTo(0, downloadElem.scrollHeight);
+                }
+                chapterHtml = chapter.html;
+            }
+            for (const link of cssRegistry[c.id] || []){
+                if (!imgAssests.includes(link)) imgAssests.push(link);
+            }
+            files.push({
+                name: "OEBPS/" + truncate(c.id),
+                input: fixXhtml(idToMetaId[c.id] || c.id, src, chapterHtml, imgAssests, cssRegistry[c.id] || [])
+            });
+            processed += 1;
+            const acc = downloadElem.querySelector("span#chapAcc");
+            if (acc) acc.innerHTML = ` ${processed}/${totComp}`;
+        }
+        if (harvested){
+            console.log(`LibreGRAB: read ${harvested} chapter(s) from their loaded frames`);
+            downloadElem.innerHTML += `Read ${harvested} chapter(s) from their loaded frames<br>`;
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        }
+        if (refetched)
+            console.log(`LibreGRAB: re-fetched ${refetched} chapter(s) the capture missed`);
+
 
         downloadElem.innerHTML += `Downloading assets <span id="assetGath"> 0/${imgAssests.length} </span><br>`
         downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
 
-        gc = 0;
+        let gc = 0;
         await Promise.all(imgAssests.map(name=>(async function(){
             const response = await fetch(name.startsWith("http") ? name : location.origin + "/" + name);
             if (response.status != 200) {
@@ -1062,6 +2149,16 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
 
         await createContent(files, imageAssets);
 
+        // Hard completeness check: never save a book that is missing
+        // spine chapters.
+        const missing = missingChapterFiles(files, getBookComponents());
+        if (missing.length){
+            downloadElem.innerHTML += `<br><b>ERROR:</b> ${missing.length} of ${getBookComponents().length} chapter(s) missing from the EPUB (${missing.slice(0, 3).join(", ")}${missing.length > 3 ? ", ..." : ""}). The file was NOT saved - please report this.<br>`;
+            downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            downloadState = -1;
+            return;
+        }
+
         makePackage(files, imageAssets);
         makeToc(files);
 
@@ -1118,42 +2215,11 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         s.innerHTML = CSS;
         document.head.appendChild(s)
 
-        if (!window.__bif_cfc1){
-            alert("Injection failed! __bif_cfc1 not found");
-            return;
-        }
-
-        // Debug: Log the original function structure
-        console.log("Original __bif_cfc1:", window.__bif_cfc1);
-        console.log("__bif_cfc1.__boundArgs:", window.__bif_cfc1.__boundArgs);
-        const old_crf1 = window.__bif_cfc1;
-        window.__bif_cfc1 = (win, edata)=>{
-            // If the bind hook succeeds, then the first element of bound args
-            // will be the decryption function. So we just passivly build up an
-            // index of the pages!
-            if (old_crf1.__boundArgs && old_crf1.__boundArgs[0]) {
-                pages[win.name] = old_crf1.__boundArgs[0](edata);
-            } else {
-                console.warn("Bind args not found, trying alternative decryption method");
-                // Try global decryption function if available
-                if (window.__libregrab_decryption_fn) {
-                    try {
-                        pages[win.name] = window.__libregrab_decryption_fn(edata);
-                    } catch (error) {
-                        console.error("Global decryption function failed:", error);
-                    }
-                }
-                // Final fallback: try to extract decrypted content directly
-                try {
-                    pages[win.name] = old_crf1(win, edata);
-                } catch (error) {
-                    console.error("Failed to decrypt content:", error);
-                    console.log("Attempting raw edata extraction");
-                    pages[win.name] = edata; // Sometimes the edata is already decrypted
-                }
-            }
-            return old_crf1(win, edata);
-        };
+        // Wrap the reader's __bif_cfc1/__bif_cfc0 handlers so each
+        // chapter shell's payload is decrypted and stashed as it loads.
+        // The original handlers are always called through so the reader
+        // renders normally.
+        installChapterCapture();
 
         buildBookPirateUi();
     }
@@ -1166,23 +2232,17 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         downloadElem.classList.add("active");
         downloadElem.innerHTML = "<b>Starting download</b><br>";
 
-        downloadEPUB().then(()=>{});
+        downloadEPUB().then(()=>{}).catch(e=>{
+            console.error("LibreGRAB: EPUB export failed", e);
+            try {
+                downloadElem.innerHTML += "<br><b>ERROR:</b> " + (e && e.message ? e.message : e) + "<br>";
+                downloadElem.scrollTo(0, downloadElem.scrollHeight);
+            } catch(_){}
+            downloadState = -1;
+        });
     }
     function buildBookPirateUi(){
-        // Create the nav
-        let nav = document.createElement("div");
-        nav.innerHTML = bookNav;
-        nav.querySelector("#download").onclick = downloadEPUBBBtn;
-        nav.classList.add("pNav");
-        let pbar = document.querySelector(".nav-progress-bar");
-        pbar.insertBefore(nav, pbar.children[1]);
-
-
-
-        downloadElem = document.createElement("div");
-        downloadElem.classList.add("foldMenu");
-        downloadElem.setAttribute("tabindex", "-1"); // Don't mess with tab key
-        document.body.appendChild(downloadElem);
+        buildReaderUi(bookNav, {download: downloadEPUBBBtn});
     }
 
     /* =========================================
@@ -1195,21 +2255,40 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
        =========================================
     */
 
-    // The "BIF" contains all the info we need to download
-    // stuff, so we wait until the page is loaded, and the
-    // BIF is present, to inject the pirate menu.
+    // Wait until the player has fully initialized before building the UI:
+    // building during load races the player's setup and redirects
+    // (audiobooks: to terms; ebooks: to the ToC). Readiness is BIF present
+    // plus a stable progress bar; audiobooks also need spool components
+    // and bootstrap params. A throw while checking never escapes: keep polling.
+    let __pbarCount = -1, __stablePolls = 0;
+    // The progress bar's child count must be stable across two polls
+    // before the UI is built.
+    function progressBarStable(pbar){
+        if (pbar.children.length !== __pbarCount) { __pbarCount = pbar.children.length; __stablePolls = 0; return false; }
+        return ++__stablePolls >= 2;
+    }
     let intr = setInterval(()=>{
-        if (window.BIF != undefined && document.querySelector(".nav-progress-bar") != undefined){
+        try {
+            const pbar = document.querySelector(".nav-progress-bar");
+            if (window.BIF == undefined || pbar == undefined) { __pbarCount = -1; __stablePolls = 0; return; }
+            let mode = location.hostname.split(".")[1];
+            if (mode != "listen") {
+                if (!progressBarStable(pbar)) return;
+                clearInterval(intr);
+                BIF = window.BIF;
+                bifFoundBook();
+                return;
+            }
+            const spool = window.BIF.objects && window.BIF.objects.spool;
+            const ready = spool && Array.isArray(spool.components) && spool.components.length > 0 &&
+                odreadCmptParams != null;
+            if (!ready) { __pbarCount = -1; __stablePolls = 0; return; }
+            if (!progressBarStable(pbar)) return;
             clearInterval(intr);
             BIF = window.BIF;
-            let mode = location.hostname.split(".")[1];
-            if (mode == "listen"){
-                bifFoundAudiobook();
-            }else if (mode == "read"){
-                bifFoundBook();
-            }
-        }
-    }, 25);
+            bifFoundAudiobook();
+        } catch (e) { __pbarCount = -1; __stablePolls = 0; }
+    }, 500);
     }
 
     function injectPageScript(code) {
@@ -1219,15 +2298,6 @@ window.__libregrabClientZipReady = new Promise((resolve, reject) => {
         script.remove();
     }
 
-    injectPageScript(`${clientZipReadyCode}(${mainCode.toString()})();`);
+    injectPageScript(`(${mainCode.toString()})();`);
 
-    fetch('https://unpkg.com/client-zip@2.5.0/worker.js')
-        .then(r => r.text())
-        .then(clientZipCode => {
-            injectPageScript(clientZipCode + ';\nwindow.__libregrabResolveClientZip?.(window.downloadZip);');
-        })
-        .catch(error => {
-            console.error('LibreGRAB: failed to load client-zip', error);
-            injectPageScript('window.__libregrabRejectClientZip?.(new Error("client-zip failed to load"));');
-        });
 })();
